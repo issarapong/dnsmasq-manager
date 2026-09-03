@@ -1,0 +1,7 @@
+# build artifacts ของแอป (build.sh สร้างใหม่ได้เสมอ)
+/app/dnsdev
+/app/dnsdev-arm64
+/app/dnsdev-x86_64
+.build/
+build/
+.DS_Store

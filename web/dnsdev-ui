@@ -1,0 +1,536 @@
+#!/usr/bin/env python3
+"""dnsdev-ui — หน้าเว็บจัดการ local dev DNS (dnsmasq + /etc/resolver)
+
+รันแล้วเปิด browser ให้เอง  ปิดด้วย Ctrl+C
+ทำงานได้ทั้ง Intel (/usr/local) และ Apple Silicon (/opt/homebrew)
+
+งานที่ต้องสิทธิ์ root (แตะ /etc/resolver, restart dnsmasq) จะรวบเป็นชุดเดียว
+แล้วขอผ่าน dialog ของ macOS — กรอกรหัสครั้งเดียวต่อหนึ่งการกระทำ
+เซิร์ฟเวอร์เองรันด้วยสิทธิ์ผู้ใช้ปกติ ไม่ได้รันเป็น root
+"""
+import http.server, json, os, re, secrets, shutil, socket, subprocess, sys, threading, webbrowser
+from pathlib import Path
+
+RESOLVER = Path("/etc/resolver")
+SERVICE = "homebrew.mxcl.dnsmasq"
+TOKEN = secrets.token_urlsafe(24)
+
+
+def brew_prefix() -> Path:
+    cands = []
+    if shutil.which("brew"):
+        try:
+            cands.append(subprocess.run(["brew", "--prefix"], capture_output=True, text=True,
+                                        timeout=10).stdout.strip())
+        except Exception:
+            pass
+    cands += ["/opt/homebrew", "/usr/local"]
+    for c in cands:
+        if c and (Path(c) / "etc/dnsmasq.conf").is_file():
+            return Path(c)
+    for c in cands:
+        if c and (Path(c) / "sbin/dnsmasq").exists():
+            return Path(c)
+    sys.exit("หา dnsmasq ไม่เจอ — ลง 'brew install dnsmasq' ก่อน")
+
+
+PREFIX = brew_prefix()
+ZONED = PREFIX / "etc/dnsmasq.d"
+CONF = PREFIX / "etc/dnsmasq.conf"
+BIN = PREFIX / "sbin/dnsmasq"
+
+RESERVED = {
+    "local": ("error", ".local ใช้ไม่ได้ — macOS ส่งไป mDNSResponder (Bonjour) เสมอ "
+                       "query ไม่มีทางถึง dnsmasq  ใช้ .test แทน"),
+    "dev": ("warn", ".dev เป็น gTLD จริงของ Google อยู่ใน HSTS preload "
+                    "browser บังคับ https ต้องมี cert"),
+    "localhost": ("warn", ".localhost macOS resolve ให้เองทุก subdomain อยู่แล้ว "
+                          "ไม่ต้องใช้ dnsmasq (แต่ชี้ได้แค่ 127.0.0.1)"),
+    "test": ("ok", "สงวนถาวรตาม RFC 6761 ปลอดภัยที่สุด"),
+}
+DOMAIN_RE = re.compile(r"^(?!-)[A-Za-z0-9-]{1,63}(?<!-)(\.(?!-)[A-Za-z0-9-]{1,63}(?<!-))+$")
+IP_RE = re.compile(r"^\d{1,3}(\.\d{1,3}){3}$")
+
+
+# ---------- privileged ----------
+def run_admin(cmd: str, prompt: str) -> tuple[bool, str]:
+    """รันคำสั่งเดียว (รวบหลายงานด้วย && ได้) ผ่าน dialog ขอสิทธิ์ของ macOS"""
+    esc = cmd.replace("\\", "\\\\").replace('"', '\\"')
+    pr = prompt.replace("\\", "\\\\").replace('"', '\\"')
+    script = f'do shell script "{esc}" with prompt "{pr}" with administrator privileges'
+    p = subprocess.run(["osascript", "-e", script], capture_output=True, text=True)
+    if p.returncode != 0:
+        err = p.stderr.strip()
+        if "-128" in err:
+            return False, "ยกเลิกการกรอกรหัส"
+        return False, err or "คำสั่งล้มเหลว"
+    return True, p.stdout.strip()
+
+
+def reload_cmds() -> list[str]:
+    return [f"launchctl kickstart -k system/{SERVICE}",
+            "dscacheutil -flushcache",
+            "killall -HUP mDNSResponder"]
+
+
+# ---------- state ----------
+def zone_path(domain: str) -> Path:
+    return ZONED / (domain.replace(".", "_") + ".conf")
+
+
+def read_zones() -> list[dict]:
+    out = []
+    if not ZONED.is_dir():
+        return out
+    for f in sorted(ZONED.glob("*.conf")):
+        try:
+            text = f.read_text(errors="replace")
+        except OSError:
+            continue
+        for m in re.finditer(r"^address=/([^/]+)/(\S+)\s*$", text, re.M):
+            d, ip = m.group(1), m.group(2)
+            out.append({"domain": d, "ip": ip, "file": str(f),
+                        "resolver": resolver_for(d)})
+    return out
+
+
+def resolver_for(domain: str) -> str | None:
+    probe = domain
+    while probe:
+        if (RESOLVER / probe).is_file():
+            return probe
+        if "." not in probe:
+            return None
+        probe = probe.split(".", 1)[1]
+    return None
+
+
+def hosts_shadow(domain: str) -> list[str]:
+    hits = []
+    try:
+        for line in Path("/etc/hosts").read_text(errors="replace").splitlines():
+            line = line.split("#", 1)[0].strip()
+            if not line:
+                continue
+            for name in line.split()[1:]:
+                if name == domain or name.endswith("." + domain):
+                    hits.append(name)
+    except OSError:
+        pass
+    return sorted(set(hits))
+
+
+def dnsmasq_running() -> int | None:
+    p = subprocess.run(["pgrep", "-f", f"{PREFIX}.*dnsmasq"], capture_output=True, text=True)
+    pids = [x for x in p.stdout.split() if x.isdigit()]
+    return int(pids[0]) if pids else None
+
+
+def syntax_ok() -> tuple[bool, str]:
+    p = subprocess.run([str(BIN), "--test", "-C", str(CONF), "-7", f"{ZONED},*.conf"],
+                       capture_output=True, text=True)
+    return p.returncode == 0, (p.stderr or p.stdout).strip()
+
+
+def probe(domain: str) -> dict:
+    """ทดสอบ 2 ชั้นด้วย subdomain สุ่ม เพื่อพิสูจน์ว่า wildcard ทำงานจริง
+    ไม่ใช่บังเอิญมีบรรทัดค้างใน /etc/hosts"""
+    name = f"wildcard-check-{secrets.randbelow(90000) + 10000}.{domain}"
+    d = subprocess.run(["dig", "+short", "+time=2", "+tries=1", "@127.0.0.1", name],
+                       capture_output=True, text=True).stdout.strip().splitlines()
+    s = subprocess.run(["dscacheutil", "-q", "host", "-a", "name", name],
+                       capture_output=True, text=True).stdout
+    sm = re.search(r"^ip_address:\s*(\S+)", s, re.M)
+    return {"probe": name,
+            "dnsmasq": d[0] if d else None,
+            "system": sm.group(1) if sm else None}
+
+
+def orphan_resolvers() -> list[str]:
+    if not RESOLVER.is_dir():
+        return []
+    zones = [z["domain"] for z in read_zones()]
+    out = []
+    for f in sorted(RESOLVER.iterdir()):
+        if not f.is_file():
+            continue
+        n = f.name
+        if not any(z == n or z.endswith("." + n) for z in zones):
+            out.append(n)
+    return out
+
+
+def snapshot() -> dict:
+    zones = read_zones()
+    ok, msg = syntax_ok()
+    pid = dnsmasq_running()
+    return {
+        "prefix": str(PREFIX), "arch": os.uname().machine,
+        "running": pid, "syntax_ok": ok, "syntax_msg": msg,
+        "conf_dir": bool(re.search(r"^\s*conf-dir=", CONF.read_text(errors="replace"), re.M))
+                    if CONF.is_file() else False,
+        "zones": [dict(z, shadow=hosts_shadow(z["domain"])) for z in zones],
+        "orphans": orphan_resolvers(),
+    }
+
+
+# ---------- actions ----------
+def act_add(domain: str, ip: str) -> dict:
+    domain = domain.strip().strip(".").lower()
+    ip = (ip or "127.0.0.1").strip()
+    if not DOMAIN_RE.match(domain):
+        return {"ok": False, "msg": f"รูปแบบโดเมนไม่ถูกต้อง: {domain}"}
+    if not IP_RE.match(ip) or any(int(o) > 255 for o in ip.split(".")):
+        return {"ok": False, "msg": f"IP ไม่ถูกต้อง: {ip}"}
+    tld = domain.rsplit(".", 1)[-1]
+    level, note = RESERVED.get(tld, ("warn", f".{tld} ไม่ใช่ TLD ที่สงวนไว้ "
+                                             "อาจถูกขายเป็นโดเมนจริงในอนาคต — .test ปลอดภัยกว่า"))
+    if level == "error":
+        return {"ok": False, "msg": note}
+
+    zp = zone_path(domain)
+    prev = zp.read_text(errors="replace") if zp.is_file() else None
+    zp.write_text(f"# {domain} — wildcard ครอบทุก subdomain ทุกชั้น\n"
+                  f"# สร้างโดย dnsdev-ui\n"
+                  f"address=/{domain}/{ip}\n")
+
+    ok, msg = syntax_ok()
+    if not ok:
+        zp.write_text(prev) if prev is not None else zp.unlink(missing_ok=True)
+        return {"ok": False, "msg": f"config syntax ผิด ยกเลิกแล้ว: {msg}"}
+
+    cmds = []
+    existing = resolver_for(domain)
+    if not existing:
+        cmds.append(f"mkdir -p {RESOLVER} && printf 'nameserver 127.0.0.1\\n' > {RESOLVER}/{tld}")
+    cmds += reload_cmds()
+    good, out = run_admin(" && ".join(cmds), f"dnsdev — เพิ่ม {domain}")
+    if not good:
+        zp.write_text(prev) if prev is not None else zp.unlink(missing_ok=True)
+        return {"ok": False, "msg": f"ย้อนกลับแล้ว: {out}"}
+
+    res = probe(domain)
+    warn = None if level == "ok" else note
+    return {"ok": True, "msg": f"เพิ่ม {domain} → {ip} แล้ว", "probe": res,
+            "warn": warn, "new_resolver": None if existing else tld,
+            "shadow": hosts_shadow(domain)}
+
+
+def act_remove(domain: str) -> dict:
+    zp = zone_path(domain)
+    if not zp.is_file():
+        return {"ok": False, "msg": f"ไม่มี zone: {domain}"}
+    backup = zp.read_text(errors="replace")
+    zp.unlink()
+
+    tld = domain.rsplit(".", 1)[-1]
+    cmds = []
+    if (RESOLVER / tld).is_file() and not any(
+            z["domain"] == tld or z["domain"].endswith("." + tld) for z in read_zones()):
+        cmds.append(f"rm -f {RESOLVER}/{tld}")
+    cmds += reload_cmds()
+    good, out = run_admin(" && ".join(cmds), f"dnsdev — ลบ {domain}")
+    if not good:
+        zp.write_text(backup)
+        return {"ok": False, "msg": f"ย้อนกลับแล้ว: {out}"}
+    return {"ok": True, "msg": f"ลบ {domain} แล้ว"}
+
+
+def act_restart() -> dict:
+    good, out = run_admin(" && ".join(reload_cmds()), "dnsdev — restart dnsmasq")
+    return {"ok": good, "msg": "restart + flush cache แล้ว" if good else out}
+
+
+# ---------- HTTP ----------
+class Handler(http.server.BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
+    def log_message(self, *a):
+        pass
+
+    def _send(self, code, body: bytes, ctype):
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _json(self, obj, code=200):
+        self._send(code, json.dumps(obj).encode(), "application/json; charset=utf-8")
+
+    def _authed(self) -> bool:
+        # กัน CSRF: เว็บอื่นใน browser เดียวกันยิง POST มาที่ 127.0.0.1 ได้
+        # ถ้าไม่มี token ป้องกันไว้ จึงบังคับ header ที่เว็บอื่นอ่าน token ไม่ได้
+        if self.headers.get("X-Token") != TOKEN:
+            self._json({"ok": False, "msg": "token ไม่ถูกต้อง"}, 403)
+            return False
+        return True
+
+    def do_GET(self):
+        path = self.path.split("?", 1)[0]
+        if path == "/":
+            self._send(200, PAGE.encode(), "text/html; charset=utf-8")
+        elif path == "/api/state":
+            if not self._authed():
+                return
+            self._json(snapshot())
+        else:
+            self._send(404, b"not found", "text/plain")
+
+    def do_POST(self):
+        if not self._authed():
+            return
+        n = int(self.headers.get("Content-Length") or 0)
+        try:
+            data = json.loads(self.rfile.read(n) or b"{}")
+        except json.JSONDecodeError:
+            return self._json({"ok": False, "msg": "payload ไม่ถูกต้อง"}, 400)
+        path = self.path.split("?", 1)[0]
+        try:
+            if path == "/api/add":
+                self._json(act_add(data.get("domain", ""), data.get("ip", "")))
+            elif path == "/api/remove":
+                self._json(act_remove(data.get("domain", "")))
+            elif path == "/api/restart":
+                self._json(act_restart())
+            elif path == "/api/test":
+                self._json({"ok": True, "probe": probe(data.get("domain", ""))})
+            else:
+                self._json({"ok": False, "msg": "ไม่รู้จัก endpoint"}, 404)
+        except Exception as e:
+            self._json({"ok": False, "msg": f"{type(e).__name__}: {e}"}, 500)
+
+
+def free_port(start=7654) -> int:
+    for p in range(start, start + 40):
+        with socket.socket() as s:
+            try:
+                s.bind(("127.0.0.1", p))
+                return p
+            except OSError:
+                continue
+    sys.exit("หาพอร์ตว่างไม่ได้")
+
+
+def main():
+    port = free_port()
+    url = f"http://127.0.0.1:{port}/#{TOKEN}"
+    srv = http.server.ThreadingHTTPServer(("127.0.0.1", port), Handler)
+    print(f"\n  dnsdev-ui  →  {url}")
+    print(f"  prefix: {PREFIX}  ({os.uname().machine})")
+    print("  ปิดด้วย Ctrl+C\n")
+    threading.Timer(0.4, lambda: webbrowser.open(url)).start()
+    try:
+        srv.serve_forever()
+    except KeyboardInterrupt:
+        print("ปิดแล้ว")
+        srv.shutdown()
+
+
+PAGE = r"""<!doctype html>
+<html lang="th"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>dnsdev</title>
+<style>
+:root{
+  --bg:#f7f7f5; --panel:#fff; --line:#e3e2dd; --fg:#1a1a18; --dim:#6b6a64;
+  --accent:#3d5a3d; --ok:#2f6b3f; --warn:#8a6516; --err:#9b3232;
+  --ok-bg:#e8f2ea; --warn-bg:#faf1dc; --err-bg:#fbeaea; --code:#f0efec;
+}
+@media (prefers-color-scheme:dark){:root:not([data-theme=light]){
+  --bg:#16171a; --panel:#1d1f23; --line:#2f3238; --fg:#e8e8e6; --dim:#94958f;
+  --accent:#8fbf8f; --ok:#7fc08f; --warn:#dcae5a; --err:#e08585;
+  --ok-bg:#1d2b21; --warn-bg:#2e2718; --err-bg:#2e1d1d; --code:#26282d;
+}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);
+  font:14px/1.55 ui-sans-serif,-apple-system,"SF Pro Text","Helvetica Neue",sans-serif}
+code,.mono{font-family:ui-monospace,"SF Mono",Menlo,monospace;font-size:13px}
+.wrap{max-width:860px;margin:0 auto;padding:28px 20px 80px}
+h1{font-size:19px;margin:0;letter-spacing:-.01em}
+h2{font-size:12px;text-transform:uppercase;letter-spacing:.09em;color:var(--dim);
+  margin:30px 0 10px;font-weight:600}
+header{display:flex;align-items:baseline;gap:12px;flex-wrap:wrap;margin-bottom:4px}
+.sub{color:var(--dim);font-size:12.5px}
+.pills{display:flex;gap:6px;flex-wrap:wrap;margin:14px 0 4px}
+.pill{font-size:12px;padding:3px 9px;border-radius:99px;border:1px solid var(--line);
+  background:var(--panel);color:var(--dim)}
+.pill.on{color:var(--ok);border-color:var(--ok);background:var(--ok-bg)}
+.pill.off{color:var(--err);border-color:var(--err);background:var(--err-bg)}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:9px}
+form.add{display:flex;gap:8px;flex-wrap:wrap;padding:14px}
+input{flex:1;min-width:190px;padding:8px 11px;border:1px solid var(--line);border-radius:6px;
+  background:var(--bg);color:var(--fg);font:inherit}
+input.ip{flex:0 0 150px;min-width:130px}
+input:focus{outline:2px solid var(--accent);outline-offset:-1px;border-color:transparent}
+button{padding:8px 15px;border-radius:6px;border:1px solid transparent;background:var(--accent);
+  color:var(--bg);font:inherit;font-weight:600;cursor:pointer}
+button:hover{filter:brightness(1.12)}
+button:disabled{opacity:.5;cursor:default}
+button.ghost{background:transparent;color:var(--dim);border-color:var(--line);font-weight:500}
+button.ghost:hover{color:var(--fg);border-color:var(--dim);filter:none}
+button.danger:hover{color:var(--err);border-color:var(--err)}
+.zone{display:flex;align-items:center;gap:12px;padding:12px 14px;border-top:1px solid var(--line);
+  flex-wrap:wrap}
+.zone:first-child{border-top:0}
+.zone .d{font-weight:600;flex:1;min-width:170px}
+.zone .d small{display:block;font-weight:400;color:var(--dim);font-size:12px}
+.badge{font-size:11.5px;padding:2px 8px;border-radius:99px;white-space:nowrap}
+.b-ok{background:var(--ok-bg);color:var(--ok)}
+.b-warn{background:var(--warn-bg);color:var(--warn)}
+.b-err{background:var(--err-bg);color:var(--err)}
+.note{padding:11px 13px;border-radius:7px;font-size:13px;margin:8px 0;border:1px solid transparent}
+.n-ok{background:var(--ok-bg);color:var(--ok);border-color:var(--ok)}
+.n-warn{background:var(--warn-bg);color:var(--warn);border-color:var(--warn)}
+.n-err{background:var(--err-bg);color:var(--err);border-color:var(--err)}
+.empty{padding:22px 14px;color:var(--dim);text-align:center}
+.result{margin:10px 14px 14px;padding:11px 13px;background:var(--code);border-radius:7px;font-size:12.5px}
+.result div{display:flex;gap:9px;align-items:baseline}
+.hint{color:var(--dim);font-size:12.5px;margin-top:9px}
+.hint code{background:var(--code);padding:1px 5px;border-radius:4px}
+#toast{position:fixed;left:50%;bottom:26px;transform:translate(-50%,80px);opacity:0;
+  transition:.22s;background:var(--panel);border:1px solid var(--line);border-radius:8px;
+  padding:11px 17px;box-shadow:0 8px 26px rgba(0,0,0,.18);max-width:88vw;font-size:13px}
+#toast.show{transform:translate(-50%,0);opacity:1}
+#toast.err{border-color:var(--err);color:var(--err)}
+#toast.ok{border-color:var(--ok);color:var(--ok)}
+.busy{opacity:.55;pointer-events:none}
+</style></head><body>
+<div class="wrap">
+  <header>
+    <h1>dnsdev</h1>
+    <span class="sub">local dev DNS — dnsmasq + /etc/resolver</span>
+  </header>
+  <div class="pills" id="pills"></div>
+
+  <h2>เพิ่มโดเมน</h2>
+  <div class="card">
+    <form class="add" id="addf" autocomplete="off">
+      <input id="dom" placeholder="myapp.test" spellcheck="false" required>
+      <input id="ip" class="ip mono" placeholder="127.0.0.1" spellcheck="false">
+      <button id="addb">เพิ่ม</button>
+    </form>
+  </div>
+  <div class="hint">wildcard ครอบทุก subdomain ทุกชั้นอัตโนมัติ — เพิ่ม <code>api.myapp.test</code>
+    ทีหลังไม่ต้องมาตั้งอะไรอีก · เว้น IP ว่าง = <code>127.0.0.1</code> ·
+    ชี้ VM ก็ได้ เช่น <code>10.100.0.9</code> (กฎที่เจาะจงกว่าชนะ wildcard เสมอ)</div>
+
+  <h2>zones</h2>
+  <div class="card" id="zones"><div class="empty">กำลังโหลด…</div></div>
+
+  <h2>ตรวจสุขภาพ</h2>
+  <div id="doctor"></div>
+</div>
+<div id="toast"></div>
+<script>
+const TOKEN = location.hash.slice(1);
+const $ = s => document.querySelector(s);
+const esc = s => String(s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+
+let toastT;
+function toast(msg, kind){
+  const t = $('#toast'); t.textContent = msg; t.className = 'show ' + (kind||'');
+  clearTimeout(toastT); toastT = setTimeout(()=>t.className='', 5200);
+}
+async function api(path, body){
+  const r = await fetch(path, {
+    method: body ? 'POST' : 'GET',
+    headers: {'X-Token': TOKEN, 'Content-Type':'application/json'},
+    body: body ? JSON.stringify(body) : undefined});
+  return r.json();
+}
+
+function probeRow(p){
+  const line = (label, val) => `<div><span class="badge ${val?'b-ok':'b-err'}">${val?'ผ่าน':'ไม่ผ่าน'}</span>
+    <span>${label}</span><span class="mono" style="color:var(--dim)">${val?esc(val):'ไม่ตอบ'}</span></div>`;
+  return `<div class="result">
+    <div style="color:var(--dim);margin-bottom:6px">ยิง <span class="mono">${esc(p.probe)}</span>
+      — ชื่อสุ่มที่ไม่เคยมีใน /etc/hosts</div>
+    ${line('ชั้น dnsmasq', p.dnsmasq)}${line('ชั้นระบบ (ที่ app ใช้จริง)', p.system)}</div>`;
+}
+
+function render(s){
+  $('#pills').innerHTML =
+    `<span class="pill ${s.running?'on':'off'}">${s.running?'dnsmasq ทำงาน · pid '+s.running:'dnsmasq ไม่ได้รัน'}</span>
+     <span class="pill ${s.syntax_ok?'':'off'}">${s.syntax_ok?'syntax ผ่าน':'syntax ผิด'}</span>
+     <span class="pill ${s.conf_dir?'':'off'}">${s.conf_dir?'conf-dir ok':'ไม่มี conf-dir'}</span>
+     <span class="pill">${esc(s.prefix)} · ${esc(s.arch)}</span>`;
+
+  const z = $('#zones');
+  if(!s.zones.length){
+    z.innerHTML = '<div class="empty">ยังไม่มี zone — เพิ่มด้านบนได้เลย</div>';
+  } else {
+    z.innerHTML = s.zones.map(x => {
+      const rb = x.resolver
+        ? `<span class="badge b-ok">/etc/resolver/${esc(x.resolver)}</span>`
+        : `<span class="badge b-err">ไม่มี resolver — ใช้ไม่ได้</span>`;
+      const sh = x.shadow.length
+        ? `<span class="badge b-warn">/etc/hosts ทับ ${x.shadow.length}</span>` : '';
+      return `<div class="zone" data-d="${esc(x.domain)}">
+        <div class="d">*.${esc(x.domain)}<small class="mono">→ ${esc(x.ip)}</small></div>
+        ${rb}${sh}
+        <button class="ghost act-test">ทดสอบ</button>
+        <button class="ghost danger act-rm">ลบ</button></div>`;
+    }).join('');
+  }
+
+  const d = [];
+  if(!s.running) d.push(['err','dnsmasq ไม่ได้รัน — <code>sudo brew services start dnsmasq</code>']);
+  if(!s.syntax_ok) d.push(['err','config syntax ผิด: '+esc(s.syntax_msg)]);
+  if(!s.conf_dir) d.push(['err','dnsmasq.conf ไม่มี <code>conf-dir=</code> — ไฟล์ zone จะไม่ถูกอ่านเลย']);
+  s.zones.filter(x=>!x.resolver).forEach(x =>
+    d.push(['err',`<b>${esc(x.domain)}</b> ไม่มี /etc/resolver — dnsmasq ตอบถูกแต่ macOS ไม่ส่ง query มาให้ ลบแล้วเพิ่มใหม่เพื่อให้สร้างให้`]));
+  s.zones.filter(x=>x.shadow.length).forEach(x =>
+    d.push(['warn',`<b>${esc(x.domain)}</b> ถูก /etc/hosts ทับ (${x.shadow.map(esc).join(', ')}) — hosts ชนะ DNS เสมอ subdomain อื่นจะยังใช้ไม่ได้`]));
+  s.orphans.forEach(o =>
+    d.push(['warn',`<code>/etc/resolver/${esc(o)}</code> ไม่มี zone รองรับ — query จะวิ่งไป dnsmasq แล้ว forward ออก internet เปล่า ๆ ทำให้ช้า`]));
+  $('#doctor').innerHTML = d.length
+    ? d.map(([k,m])=>`<div class="note n-${k}">${m}</div>`).join('')
+    : '<div class="note n-ok">ไม่พบปัญหา</div>';
+}
+
+async function refresh(){ render(await api('/api/state')); }
+
+$('#addf').addEventListener('submit', async e => {
+  e.preventDefault();
+  const domain = $('#dom').value.trim(), ip = $('#ip').value.trim();
+  if(!domain) return;
+  document.body.classList.add('busy'); $('#addb').textContent = 'รอกรอกรหัส…';
+  const r = await api('/api/add', {domain, ip});
+  document.body.classList.remove('busy'); $('#addb').textContent = 'เพิ่ม';
+  toast(r.msg, r.ok ? 'ok' : 'err');
+  if(r.ok){
+    $('#dom').value = ''; $('#ip').value = '';
+    await refresh();
+    if(r.warn) toast(r.warn, 'err');
+    const row = document.querySelector(`.zone[data-d="${CSS.escape(domain.trim().toLowerCase())}"]`);
+    if(row && r.probe) row.insertAdjacentHTML('afterend', probeRow(r.probe));
+  }
+});
+
+$('#zones').addEventListener('click', async e => {
+  const row = e.target.closest('.zone'); if(!row) return;
+  const domain = row.dataset.d;
+  if(e.target.classList.contains('act-test')){
+    e.target.disabled = true;
+    const r = await api('/api/test', {domain});
+    e.target.disabled = false;
+    row.parentNode.querySelectorAll('.result').forEach(n=>n.remove());
+    row.insertAdjacentHTML('afterend', probeRow(r.probe));
+  }
+  if(e.target.classList.contains('act-rm')){
+    document.body.classList.add('busy');
+    const r = await api('/api/remove', {domain});
+    document.body.classList.remove('busy');
+    toast(r.msg, r.ok ? 'ok' : 'err');
+    refresh();
+  }
+});
+
+refresh();
+</script></body></html>"""
+
+
+if __name__ == "__main__":
+    main()

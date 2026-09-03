@@ -1,0 +1,545 @@
+// dnsdev — menu bar app จัดการ local dev DNS (dnsmasq + /etc/resolver)
+//
+// ตัวแอปรันด้วยสิทธิ์ผู้ใช้ปกติ งานที่ต้อง root จะรวบเป็นคำสั่งเดียว
+// แล้วขอผ่าน dialog ของ macOS — กรอกรหัสครั้งเดียวต่อหนึ่งการกระทำ
+
+import SwiftUI
+import AppKit
+
+// MARK: - Model
+
+struct Zone: Identifiable, Equatable {
+    var domain: String
+    var ip: String
+    var file: String
+    var resolver: String?
+    var shadow: [String]
+    var id: String { domain }
+}
+
+struct Probe: Equatable {
+    var name: String
+    var dnsmasq: String?
+    var system: String?
+    var bothOK: Bool { dnsmasq != nil && system != nil }
+}
+
+struct Issue: Identifiable, Equatable {
+    enum Level { case err, warn }
+    let id = UUID()
+    var level: Level
+    var text: String
+}
+
+// MARK: - System glue
+
+enum Sys {
+    static let resolverDir = "/etc/resolver"
+    static let service = "homebrew.mxcl.dnsmasq"
+
+    /// หา Homebrew prefix ให้ทำงานได้ทั้ง Intel (/usr/local) และ Apple Silicon (/opt/homebrew)
+    static let prefix: String = {
+        var cands: [String] = []
+        if let p = run("/bin/sh", ["-lc", "command -v brew >/dev/null && brew --prefix"]).out
+            .trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty { cands.append(p) }
+        cands += ["/opt/homebrew", "/usr/local"]
+        for c in cands where FileManager.default.fileExists(atPath: c + "/etc/dnsmasq.conf") { return c }
+        for c in cands where FileManager.default.fileExists(atPath: c + "/sbin/dnsmasq") { return c }
+        return "/usr/local"
+    }()
+
+    static var zoneDir: String { prefix + "/etc/dnsmasq.d" }
+    static var confFile: String { prefix + "/etc/dnsmasq.conf" }
+    static var binFile: String { prefix + "/sbin/dnsmasq" }
+    static var arch: String {
+        #if arch(arm64)
+        return "arm64"
+        #else
+        return "x86_64"
+        #endif
+    }
+
+    @discardableResult
+    static func run(_ path: String, _ args: [String]) -> (code: Int32, out: String, err: String) {
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: path)
+        p.arguments = args
+        let o = Pipe(), e = Pipe()
+        p.standardOutput = o; p.standardError = e
+        do { try p.run() } catch { return (-1, "", "\(error)") }
+        let od = o.fileHandleForReading.readDataToEndOfFile()
+        let ed = e.fileHandleForReading.readDataToEndOfFile()
+        p.waitUntilExit()
+        return (p.terminationStatus,
+                String(decoding: od, as: UTF8.self),
+                String(decoding: ed, as: UTF8.self))
+    }
+
+    /// รันคำสั่ง (รวบหลายงานด้วย && ได้) ผ่าน dialog ขอสิทธิ์ของ macOS
+    static func admin(_ cmd: String, prompt: String) -> (ok: Bool, msg: String) {
+        func esc(_ s: String) -> String {
+            s.replacingOccurrences(of: "\\", with: "\\\\")
+             .replacingOccurrences(of: "\"", with: "\\\"")
+        }
+        let script = "do shell script \"\(esc(cmd))\" with prompt \"\(esc(prompt))\" with administrator privileges"
+        let r = run("/usr/bin/osascript", ["-e", script])
+        if r.code != 0 {
+            let e = r.err.trimmingCharacters(in: .whitespacesAndNewlines)
+            return (false, e.contains("-128") ? "ยกเลิกการกรอกรหัส" : (e.isEmpty ? "คำสั่งล้มเหลว" : e))
+        }
+        return (true, r.out.trimmingCharacters(in: .whitespacesAndNewlines))
+    }
+
+    static var reloadCmds: [String] {
+        ["launchctl kickstart -k system/\(service)",
+         "dscacheutil -flushcache",
+         "killall -HUP mDNSResponder"]
+    }
+
+    // ---- reads ----
+
+    static func zonePath(_ domain: String) -> String {
+        zoneDir + "/" + domain.replacingOccurrences(of: ".", with: "_") + ".conf"
+    }
+
+    static func resolverFor(_ domain: String) -> String? {
+        var probe = domain
+        while !probe.isEmpty {
+            if FileManager.default.fileExists(atPath: "\(resolverDir)/\(probe)") { return probe }
+            guard let dot = probe.firstIndex(of: ".") else { return nil }
+            probe = String(probe[probe.index(after: dot)...])
+        }
+        return nil
+    }
+
+    static func hostsShadow(_ domain: String) -> [String] {
+        guard let text = try? String(contentsOfFile: "/etc/hosts", encoding: .utf8) else { return [] }
+        var hits = Set<String>()
+        for raw in text.split(separator: "\n", omittingEmptySubsequences: false) {
+            let line = raw.split(separator: "#", maxSplits: 1, omittingEmptySubsequences: false)[0]
+            let parts = line.split(whereSeparator: \.isWhitespace).map(String.init)
+            guard parts.count > 1 else { continue }
+            for name in parts.dropFirst() where name == domain || name.hasSuffix("." + domain) {
+                hits.insert(name)
+            }
+        }
+        return hits.sorted()
+    }
+
+    static func zones() -> [Zone] {
+        guard let files = try? FileManager.default.contentsOfDirectory(atPath: zoneDir) else { return [] }
+        var out: [Zone] = []
+        for f in files.sorted() where f.hasSuffix(".conf") {
+            let path = zoneDir + "/" + f
+            guard let text = try? String(contentsOfFile: path, encoding: .utf8) else { continue }
+            for raw in text.split(separator: "\n") {
+                let line = raw.trimmingCharacters(in: .whitespaces)
+                guard line.hasPrefix("address=/") else { continue }
+                let body = String(line.dropFirst("address=/".count))
+                let seg = body.split(separator: "/", maxSplits: 1).map(String.init)
+                guard seg.count == 2 else { continue }
+                let d = seg[0]
+                out.append(Zone(domain: d, ip: seg[1], file: path,
+                                resolver: resolverFor(d), shadow: hostsShadow(d)))
+            }
+        }
+        return out
+    }
+
+    static func dnsmasqPID() -> Int? {
+        let r = run("/usr/bin/pgrep", ["-f", "\(prefix).*dnsmasq"])
+        return r.out.split(whereSeparator: \.isWhitespace).first.flatMap { Int($0) }
+    }
+
+    static func syntaxOK() -> (Bool, String) {
+        let r = run(binFile, ["--test", "-C", confFile, "-7", "\(zoneDir),*.conf"])
+        let m = (r.err.isEmpty ? r.out : r.err).trimmingCharacters(in: .whitespacesAndNewlines)
+        return (r.code == 0, m)
+    }
+
+    static func hasConfDir() -> Bool {
+        guard let t = try? String(contentsOfFile: confFile, encoding: .utf8) else { return false }
+        return t.split(separator: "\n").contains { $0.trimmingCharacters(in: .whitespaces).hasPrefix("conf-dir=") }
+    }
+
+    static func orphanResolvers(_ zones: [Zone]) -> [String] {
+        guard let files = try? FileManager.default.contentsOfDirectory(atPath: resolverDir) else { return [] }
+        return files.sorted().filter { name in
+            !zones.contains { $0.domain == name || $0.domain.hasSuffix("." + name) }
+        }
+    }
+
+    /// ยิง subdomain สุ่ม เพื่อพิสูจน์ว่า wildcard ทำงานจริง
+    /// ไม่ใช่บังเอิญมีบรรทัดค้างใน /etc/hosts
+    static func probe(_ domain: String) -> Probe {
+        let name = "wildcard-check-\(Int.random(in: 10000...99999)).\(domain)"
+        let d = run("/usr/bin/dig", ["+short", "+time=2", "+tries=1", "@127.0.0.1", name])
+            .out.split(separator: "\n").first.map(String.init)
+        let s = run("/usr/bin/dscacheutil", ["-q", "host", "-a", "name", name]).out
+        var sys: String?
+        for line in s.split(separator: "\n") where line.hasPrefix("ip_address:") {
+            sys = line.split(separator: " ").last.map(String.init); break
+        }
+        return Probe(name: name, dnsmasq: d, system: sys)
+    }
+}
+
+extension String {
+    var nilIfEmpty: String? { isEmpty ? nil : self }
+}
+
+// MARK: - Validation & actions
+
+enum TLDVerdict { case ok(String), warn(String), blocked(String) }
+
+func verdict(forTLD tld: String) -> TLDVerdict {
+    switch tld {
+    case "local":
+        return .blocked(".local ใช้ไม่ได้ — macOS ส่งไป mDNSResponder (Bonjour) เสมอ "
+                      + "query ไม่มีทางถึง dnsmasq  ใช้ .test แทน")
+    case "dev":
+        return .warn(".dev เป็น gTLD จริงของ Google อยู่ใน HSTS preload "
+                   + "browser บังคับ https ต้องมี cert")
+    case "localhost":
+        return .warn(".localhost macOS resolve ให้เองทุก subdomain อยู่แล้ว "
+                   + "ไม่ต้องใช้ dnsmasq (แต่ชี้ได้แค่ 127.0.0.1)")
+    case "test":
+        return .ok("สงวนถาวรตาม RFC 6761")
+    default:
+        return .warn(".\(tld) ไม่ใช่ TLD ที่สงวนไว้ อาจถูกขายเป็นโดเมนจริงในอนาคต — .test ปลอดภัยกว่า")
+    }
+}
+
+func validDomain(_ s: String) -> Bool {
+    let labels = s.split(separator: ".", omittingEmptySubsequences: false)
+    guard labels.count >= 2 else { return false }
+    for l in labels {
+        guard (1...63).contains(l.count), !l.hasPrefix("-"), !l.hasSuffix("-"),
+              l.allSatisfy({ $0.isLetter || $0.isNumber || $0 == "-" }) else { return false }
+    }
+    return true
+}
+
+func validIP(_ s: String) -> Bool {
+    let o = s.split(separator: ".", omittingEmptySubsequences: false)
+    return o.count == 4 && o.allSatisfy { !$0.isEmpty && $0.allSatisfy(\.isNumber) && (Int($0) ?? 999) <= 255 }
+}
+
+@MainActor
+final class Store: ObservableObject {
+    @Published var zones: [Zone] = []
+    @Published var pid: Int?
+    @Published var syntaxOK = true
+    @Published var syntaxMsg = ""
+    @Published var confDir = true
+    @Published var orphans: [String] = []
+    @Published var probes: [String: Probe] = [:]
+    @Published var busy = false
+    @Published var flash: (text: String, bad: Bool)?
+
+    func refresh() {
+        zones = Sys.zones()
+        pid = Sys.dnsmasqPID()
+        (syntaxOK, syntaxMsg) = Sys.syntaxOK()
+        confDir = Sys.hasConfDir()
+        orphans = Sys.orphanResolvers(zones)
+    }
+
+    var issues: [Issue] {
+        var out: [Issue] = []
+        if pid == nil { out.append(.init(level: .err, text: "dnsmasq ไม่ได้รัน — sudo brew services start dnsmasq")) }
+        if !syntaxOK { out.append(.init(level: .err, text: "config syntax ผิด: \(syntaxMsg)")) }
+        if !confDir { out.append(.init(level: .err, text: "dnsmasq.conf ไม่มี conf-dir= — ไฟล์ zone จะไม่ถูกอ่านเลย")) }
+        for z in zones where z.resolver == nil {
+            out.append(.init(level: .err, text: "\(z.domain) ไม่มี /etc/resolver — dnsmasq ตอบถูกแต่ macOS ไม่ส่ง query มาให้"))
+        }
+        for z in zones where !z.shadow.isEmpty {
+            out.append(.init(level: .warn, text: "\(z.domain) ถูก /etc/hosts ทับ (\(z.shadow.joined(separator: ", "))) — hosts ชนะ DNS เสมอ"))
+        }
+        for o in orphans {
+            out.append(.init(level: .warn, text: "/etc/resolver/\(o) ไม่มี zone รองรับ — query จะ forward ออก internet เปล่า ๆ"))
+        }
+        return out
+    }
+
+    private func say(_ t: String, bad: Bool = false) {
+        flash = (t, bad)
+        Task { try? await Task.sleep(for: .seconds(5)); if flash?.text == t { flash = nil } }
+    }
+
+    func add(domain rawDomain: String, ip rawIP: String) {
+        let domain = rawDomain.trimmingCharacters(in: .whitespaces)
+            .trimmingCharacters(in: CharacterSet(charactersIn: ".")).lowercased()
+        let ip = rawIP.trimmingCharacters(in: .whitespaces).nilIfEmpty ?? "127.0.0.1"
+        guard validDomain(domain) else { return say("รูปแบบโดเมนไม่ถูกต้อง: \(domain)", bad: true) }
+        guard validIP(ip) else { return say("IP ไม่ถูกต้อง: \(ip)", bad: true) }
+        let tld = String(domain.split(separator: ".").last!)
+        var warning: String?
+        switch verdict(forTLD: tld) {
+        case .blocked(let m): return say(m, bad: true)
+        case .warn(let m): warning = m
+        case .ok: break
+        }
+
+        let path = Sys.zonePath(domain)
+        let prev = try? String(contentsOfFile: path, encoding: .utf8)
+        let body = "# \(domain) — wildcard ครอบทุก subdomain ทุกชั้น\n# สร้างโดย dnsdev\naddress=/\(domain)/\(ip)\n"
+        do { try body.write(toFile: path, atomically: true, encoding: .utf8) }
+        catch { return say("เขียนไฟล์ไม่ได้: \(error.localizedDescription)", bad: true) }
+
+        func rollback() {
+            if let prev { try? prev.write(toFile: path, atomically: true, encoding: .utf8) }
+            else { try? FileManager.default.removeItem(atPath: path) }
+        }
+        let (ok, msg) = Sys.syntaxOK()
+        if !ok { rollback(); return say("config syntax ผิด ยกเลิกแล้ว: \(msg)", bad: true) }
+
+        var cmds: [String] = []
+        let hadResolver = Sys.resolverFor(domain) != nil
+        if !hadResolver {
+            cmds.append("mkdir -p \(Sys.resolverDir) && printf 'nameserver 127.0.0.1\\n' > \(Sys.resolverDir)/\(tld)")
+        }
+        cmds += Sys.reloadCmds
+
+        busy = true
+        let r = Sys.admin(cmds.joined(separator: " && "), prompt: "dnsdev — เพิ่ม \(domain)")
+        busy = false
+        guard r.ok else { rollback(); return say("ย้อนกลับแล้ว: \(r.msg)", bad: true) }
+
+        probes[domain] = Sys.probe(domain)
+        refresh()
+        say(warning ?? "เพิ่ม \(domain) → \(ip) แล้ว", bad: warning != nil)
+    }
+
+    func remove(_ domain: String) {
+        let path = Sys.zonePath(domain)
+        guard let backup = try? String(contentsOfFile: path, encoding: .utf8) else {
+            return say("ไม่มี zone: \(domain)", bad: true)
+        }
+        try? FileManager.default.removeItem(atPath: path)
+
+        let tld = String(domain.split(separator: ".").last ?? "")
+        var cmds: [String] = []
+        let stillUsed = Sys.zones().contains { $0.domain == tld || $0.domain.hasSuffix("." + tld) }
+        if FileManager.default.fileExists(atPath: "\(Sys.resolverDir)/\(tld)"), !stillUsed {
+            cmds.append("rm -f \(Sys.resolverDir)/\(tld)")
+        }
+        cmds += Sys.reloadCmds
+
+        busy = true
+        let r = Sys.admin(cmds.joined(separator: " && "), prompt: "dnsdev — ลบ \(domain)")
+        busy = false
+        guard r.ok else {
+            try? backup.write(toFile: path, atomically: true, encoding: .utf8)
+            return say("ย้อนกลับแล้ว: \(r.msg)", bad: true)
+        }
+        probes[domain] = nil
+        refresh()
+        say("ลบ \(domain) แล้ว")
+    }
+
+    func test(_ domain: String) { probes[domain] = Sys.probe(domain); }
+
+    func restart() {
+        busy = true
+        let r = Sys.admin(Sys.reloadCmds.joined(separator: " && "), prompt: "dnsdev — restart dnsmasq")
+        busy = false
+        refresh()
+        say(r.ok ? "restart + flush cache แล้ว" : r.msg, bad: !r.ok)
+    }
+}
+
+// MARK: - UI
+
+struct Pill: View {
+    var text: String
+    var tint: Color
+    var body: some View {
+        Text(text)
+            .font(.caption2)
+            .padding(.horizontal, 8).padding(.vertical, 3)
+            .background(tint.opacity(0.15), in: Capsule())
+            .foregroundStyle(tint)
+    }
+}
+
+struct ProbeView: View {
+    var p: Probe
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text("ยิง \(p.name)")
+                .font(.system(size: 10.5, design: .monospaced))
+                .foregroundStyle(.secondary)
+            row("ชั้น dnsmasq", p.dnsmasq)
+            row("ชั้นระบบ (ที่ app ใช้จริง)", p.system)
+        }
+        .padding(8)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Color.primary.opacity(0.05), in: RoundedRectangle(cornerRadius: 6))
+    }
+    func row(_ label: String, _ val: String?) -> some View {
+        HStack(spacing: 6) {
+            Image(systemName: val != nil ? "checkmark.circle.fill" : "xmark.circle.fill")
+                .foregroundStyle(val != nil ? .green : .red)
+                .font(.system(size: 10))
+            Text(label).font(.system(size: 11))
+            Text(val ?? "ไม่ตอบ")
+                .font(.system(size: 11, design: .monospaced))
+                .foregroundStyle(.secondary)
+        }
+    }
+}
+
+struct ZoneRow: View {
+    @EnvironmentObject var store: Store
+    var zone: Zone
+    @State private var hover = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 8) {
+                VStack(alignment: .leading, spacing: 1) {
+                    Text("*.\(zone.domain)").font(.system(size: 12.5, weight: .semibold))
+                    Text("→ \(zone.ip)")
+                        .font(.system(size: 10.5, design: .monospaced))
+                        .foregroundStyle(.secondary)
+                }
+                Spacer(minLength: 6)
+                if let r = zone.resolver {
+                    Pill(text: "/etc/resolver/\(r)", tint: .green)
+                } else {
+                    Pill(text: "ไม่มี resolver", tint: .red)
+                }
+                if !zone.shadow.isEmpty { Pill(text: "hosts ทับ \(zone.shadow.count)", tint: .orange) }
+                if hover {
+                    Button("ทดสอบ") { store.test(zone.domain) }
+                        .buttonStyle(.borderless).font(.system(size: 11))
+                    Button {
+                        store.remove(zone.domain)
+                    } label: { Image(systemName: "trash").font(.system(size: 11)) }
+                        .buttonStyle(.borderless).foregroundStyle(.red)
+                }
+            }
+            if let p = store.probes[zone.domain] { ProbeView(p: p) }
+        }
+        .padding(.vertical, 6).padding(.horizontal, 10)
+        .background(hover ? Color.primary.opacity(0.05) : .clear)
+        .onHover { hover = $0 }
+    }
+}
+
+struct ContentView: View {
+    @EnvironmentObject var store: Store
+    @State private var domain = ""
+    @State private var ip = ""
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            // header
+            HStack(spacing: 6) {
+                Text("dnsdev").font(.system(size: 14, weight: .bold))
+                Pill(text: store.pid.map { "dnsmasq · pid \($0)" } ?? "ไม่ได้รัน",
+                     tint: store.pid != nil ? .green : .red)
+                Spacer()
+                Menu {
+                    Button("restart dnsmasq") { store.restart() }
+                    Button("เปิดโฟลเดอร์ zone") {
+                        NSWorkspace.shared.open(URL(fileURLWithPath: Sys.zoneDir))
+                    }
+                    Divider()
+                    Text("\(Sys.prefix) · \(Sys.arch)")
+                    Divider()
+                    Button("ออกจากโปรแกรม") { NSApp.terminate(nil) }
+                } label: { Image(systemName: "ellipsis.circle") }
+                    .menuStyle(.borderlessButton).frame(width: 22)
+            }
+            .padding(.horizontal, 12).padding(.top, 11).padding(.bottom, 9)
+
+            Divider()
+
+            // add
+            HStack(spacing: 6) {
+                TextField("myapp.test", text: $domain)
+                    .textFieldStyle(.roundedBorder).font(.system(size: 12))
+                TextField("127.0.0.1", text: $ip)
+                    .textFieldStyle(.roundedBorder)
+                    .font(.system(size: 11, design: .monospaced))
+                    .frame(width: 92)
+                Button("เพิ่ม") {
+                    store.add(domain: domain, ip: ip)
+                    if store.flash?.bad != true { domain = ""; ip = "" }
+                }
+                .keyboardShortcut(.return, modifiers: [])
+                .disabled(domain.trimmingCharacters(in: .whitespaces).isEmpty || store.busy)
+            }
+            .padding(.horizontal, 12).padding(.vertical, 9)
+
+            Text("wildcard ครอบทุก subdomain ทุกชั้น — เพิ่ม api.myapp.test ทีหลังไม่ต้องตั้งอะไรอีก")
+                .font(.system(size: 10.5)).foregroundStyle(.secondary)
+                .padding(.horizontal, 12).padding(.bottom, 9)
+
+            Divider()
+
+            // zones
+            ScrollView {
+                VStack(alignment: .leading, spacing: 0) {
+                    if store.zones.isEmpty {
+                        Text("ยังไม่มี zone — เพิ่มด้านบนได้เลย")
+                            .font(.system(size: 12)).foregroundStyle(.secondary)
+                            .frame(maxWidth: .infinity).padding(.vertical, 22)
+                    } else {
+                        ForEach(store.zones) { z in
+                            ZoneRow(zone: z)
+                            Divider().opacity(0.4)
+                        }
+                    }
+                    if !store.issues.isEmpty {
+                        VStack(alignment: .leading, spacing: 5) {
+                            Text("ตรวจสุขภาพ")
+                                .font(.system(size: 10, weight: .semibold))
+                                .foregroundStyle(.secondary)
+                            ForEach(store.issues) { i in
+                                HStack(alignment: .top, spacing: 5) {
+                                    Image(systemName: i.level == .err
+                                          ? "exclamationmark.triangle.fill" : "info.circle.fill")
+                                        .foregroundStyle(i.level == .err ? .red : .orange)
+                                        .font(.system(size: 10))
+                                    Text(i.text).font(.system(size: 11))
+                                        .fixedSize(horizontal: false, vertical: true)
+                                }
+                            }
+                        }
+                        .padding(10)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                    }
+                }
+            }
+            .frame(maxHeight: 330)
+
+            if let f = store.flash {
+                Divider()
+                Text(f.text)
+                    .font(.system(size: 11))
+                    .foregroundStyle(f.bad ? .red : .green)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .padding(.horizontal, 12).padding(.vertical, 8)
+            }
+        }
+        .frame(width: 430)
+        .opacity(store.busy ? 0.55 : 1)
+        .onAppear { store.refresh() }
+    }
+}
+
+@main
+struct DNSDevApp: App {
+    @StateObject private var store = Store()
+    var body: some Scene {
+        MenuBarExtra {
+            ContentView().environmentObject(store)
+        } label: {
+            Image(systemName: "globe.badge.chevron.backward")
+        }
+        .menuBarExtraStyle(.window)
+    }
+}

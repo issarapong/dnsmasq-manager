@@ -1,0 +1,266 @@
+#!/usr/bin/env bash
+# dnsdev — จัดการ local dev DNS (dnsmasq + /etc/resolver) ให้จบในคำสั่งเดียว
+#
+# ปัญหาที่ตัวนี้แก้: การเพิ่มโดเมนต้องแตะ 2 ที่เสมอ — zone file ของ dnsmasq
+# กับ /etc/resolver/ ของ macOS ถ้าลืมอย่างหลัง dnsmasq จะตอบถูกทุกอย่างแต่
+# ระบบไม่เคยส่ง query มาให้เลย แล้วดีบักไม่เจอเพราะ dig ธรรมดาก็ไม่ฟ้อง
+#
+# รองรับทั้ง Intel (/usr/local) และ Apple Silicon (/opt/homebrew)
+
+set -uo pipefail
+
+# ---------- หา Homebrew prefix ให้ทำงานได้ทั้งสองสถาปัตยกรรม ----------
+PREFIX=""
+for p in "$(brew --prefix 2>/dev/null)" /opt/homebrew /usr/local; do
+  [ -n "$p" ] && [ -f "$p/etc/dnsmasq.conf" ] && { PREFIX="$p"; break; }
+done
+if [ -z "$PREFIX" ]; then
+  for p in "$(brew --prefix 2>/dev/null)" /opt/homebrew /usr/local; do
+    [ -n "$p" ] && [ -x "$p/sbin/dnsmasq" ] && { PREFIX="$p"; break; }
+  done
+fi
+[ -z "$PREFIX" ] && { echo "หา dnsmasq ไม่เจอ — ลง 'brew install dnsmasq' ก่อน" >&2; exit 1; }
+
+CONF="$PREFIX/etc/dnsmasq.conf"
+ZONED="$PREFIX/etc/dnsmasq.d"
+BIN="$PREFIX/sbin/dnsmasq"
+RESOLVER="/etc/resolver"
+SERVICE="homebrew.mxcl.dnsmasq"
+
+B=$'\033[1m'; R=$'\033[31m'; G=$'\033[32m'; Y=$'\033[33m'; D=$'\033[2m'; N=$'\033[0m'
+ok(){ printf "%s✓%s %s\n" "$G" "$N" "$*"; }
+warn(){ printf "%s!%s %s\n" "$Y" "$N" "$*"; }
+err(){ printf "%s✗%s %s\n" "$R" "$N" "$*" >&2; }
+info(){ printf "%s%s%s\n" "$D" "$*" "$N"; }
+
+# ---------- helper ----------
+
+# หา /etc/resolver ที่ครอบโดเมนนี้ (macOS จับคู่แบบ suffix ยาวสุด)
+resolver_for() {
+  local probe="$1"
+  while [ -n "$probe" ]; do
+    [ -f "$RESOLVER/$probe" ] && { echo "$probe"; return 0; }
+    case "$probe" in *.*) probe="${probe#*.}";; *) break;; esac
+  done
+  return 1
+}
+
+tld_of() { echo "${1##*.}"; }
+zone_file() { echo "$ZONED/$(echo "$1" | tr '.' '_').conf"; }
+
+check_tld() {
+  case "$(tld_of "$1")" in
+    local)
+      err ".local ใช้กับ dnsmasq ไม่ได้ — macOS ส่งไป mDNSResponder (Bonjour) เสมอ"
+      err "   query จะไม่มีทางมาถึง dnsmasq  แนะนำใช้ .test แทน"
+      return 1;;
+    dev)
+      warn ".dev เป็น gTLD จริงของ Google อยู่ใน HSTS preload"
+      warn "   browser จะบังคับ https ต้องมี cert ไม่งั้นเปิดไม่ได้";;
+    localhost)
+      warn ".localhost macOS resolve ให้เองอยู่แล้วทุก subdomain"
+      warn "   ไม่ต้องใช้ dnsmasq เลยก็ได้ (แต่จะบังคับเป็น 127.0.0.1 เท่านั้น)";;
+    test) ;;
+    *)
+      warn "$(tld_of "$1") ไม่ใช่ TLD ที่สงวนไว้ อาจถูกขายเป็นโดเมนจริงในอนาคต"
+      warn "   .test สงวนถาวรตาม RFC 6761 ปลอดภัยกว่า";;
+  esac
+  return 0
+}
+
+hosts_shadow() {
+  grep -vE '^\s*#' /etc/hosts 2>/dev/null \
+    | awk '{for(i=2;i<=NF;i++) print $i}' \
+    | grep -E "(^|\.)$(echo "$1" | sed 's/\./\\./g')$" | sort -u
+}
+
+syntax_ok() { "$BIN" --test -C "$CONF" -7 "$ZONED",'*.conf' >/dev/null 2>&1; }
+
+reload() {
+  syntax_ok || { err "config มี syntax error — ไม่ restart"; "$BIN" --test -C "$CONF" -7 "$ZONED",'*.conf'; return 1; }
+  sudo launchctl kickstart -k "system/$SERVICE" 2>/dev/null \
+    || sudo brew services restart dnsmasq >/dev/null 2>&1 \
+    || { err "restart dnsmasq ไม่สำเร็จ"; return 1; }
+  sudo dscacheutil -flushcache 2>/dev/null
+  sudo killall -HUP mDNSResponder 2>/dev/null
+  ok "restart dnsmasq + flush cache แล้ว"
+}
+
+# ---------- commands ----------
+
+cmd_add() {
+  local domain="${1:-}" ip="${2:-127.0.0.1}"
+  [ -z "$domain" ] && { err "ต้องระบุโดเมน:  dnsdev add <domain> [ip]"; exit 1; }
+  domain="${domain#.}"; domain="${domain%.}"
+
+  check_tld "$domain" || exit 1
+
+  local zf; zf="$(zone_file "$domain")"
+  [ -f "$zf" ] && warn "มีอยู่แล้ว จะเขียนทับ: $zf"
+
+  cat > "$zf" <<EOF
+# $domain — wildcard ครอบทุก subdomain ทุกชั้น
+# สร้างโดย dnsdev เมื่อ $(date '+%Y-%m-%d %H:%M:%S')
+address=/$domain/$ip
+EOF
+  ok "zone:     $zf"
+  info "          address=/$domain/$ip"
+
+  local tld; tld="$(tld_of "$domain")"
+  if existing="$(resolver_for "$domain")"; then
+    ok "resolver: /etc/resolver/$existing (มีอยู่แล้ว ครอบโดเมนนี้)"
+  else
+    echo "nameserver 127.0.0.1" | sudo tee "$RESOLVER/$tld" >/dev/null \
+      && ok "resolver: /etc/resolver/$tld (สร้างใหม่)" \
+      || { err "สร้าง /etc/resolver/$tld ไม่สำเร็จ"; exit 1; }
+    info "          ครั้งหน้าเพิ่มโดเมน .$tld อื่นจะไม่ต้อง sudo อีก"
+  fi
+
+  local shadow; shadow="$(hosts_shadow "$domain")"
+  if [ -n "$shadow" ]; then
+    echo
+    warn "/etc/hosts มีบรรทัดที่ทับโดเมนนี้อยู่ — hosts ชนะ DNS เสมอ"
+    warn "subdomain ที่ไม่ได้ระบุไว้ในนั้นจะยังใช้ไม่ได้:"
+    echo "$shadow" | sed 's/^/      /'
+    warn "ลบออกด้วย:  sudo sed -i '' '/$(echo "$domain" | sed 's/\./\\./g')/d' /etc/hosts"
+  fi
+
+  echo
+  reload && { echo; cmd_test "$domain"; }
+}
+
+cmd_rm() {
+  local domain="${1:-}"
+  [ -z "$domain" ] && { err "ต้องระบุโดเมน:  dnsdev rm <domain>"; exit 1; }
+  local zf; zf="$(zone_file "$domain")"
+  [ -f "$zf" ] || { err "ไม่มี zone นี้: $domain"; exit 1; }
+
+  rm -f "$zf" && ok "ลบ zone: $zf"
+
+  # ลบ resolver ก็ต่อเมื่อไม่มี zone ไหนใช้ TLD นี้แล้ว
+  local tld; tld="$(tld_of "$domain")"
+  if [ -f "$RESOLVER/$tld" ]; then
+    if ! grep -hoE '^address=/[^/]+/' "$ZONED"/*.conf 2>/dev/null \
+         | sed 's|^address=/||; s|/$||' | grep -qE "\.$tld$|^$tld$"; then
+      sudo rm -f "$RESOLVER/$tld" && ok "ลบ /etc/resolver/$tld (ไม่มี zone ไหนใช้ .$tld แล้ว)"
+    else
+      info "เก็บ /etc/resolver/$tld ไว้ — ยังมี zone อื่นใช้ .$tld อยู่"
+    fi
+  fi
+  echo; reload
+}
+
+cmd_ls() {
+  shopt -s nullglob
+  local files=("$ZONED"/*.conf)
+  if [ ${#files[@]} -eq 0 ]; then
+    info "ยังไม่มี zone — เพิ่มด้วย:  dnsdev add foo.test"
+    return
+  fi
+  printf "%s%-34s %-16s %s%s\n" "$B" "DOMAIN" "→ IP" "RESOLVER" "$N"
+  for f in "${files[@]}"; do
+    while IFS= read -r line; do
+      local d ip rs
+      d="$(echo "$line" | sed 's|^address=/||; s|/[^/]*$||')"
+      ip="$(echo "$line" | sed 's|.*/||')"
+      if rs="$(resolver_for "$d")"; then rs="${G}/etc/resolver/$rs${N}"
+      else rs="${R}ไม่มี — จะใช้ไม่ได้!${N}"; fi
+      printf "%-34s %-16s %b\n" "$d" "$ip" "$rs"
+    done < <(grep -hE '^address=/' "$f" 2>/dev/null)
+  done
+}
+
+cmd_test() {
+  local domain="${1:-}"
+  [ -z "$domain" ] && { err "ต้องระบุโดเมน:  dnsdev test <domain>"; exit 1; }
+  # ยิง subdomain สุ่มด้วย เพื่อพิสูจน์ว่า wildcard ทำงานจริง ไม่ใช่แค่ hosts file
+  local probe="wildcard-check-$RANDOM.$domain"
+  printf "%s%s%s\n" "$B" "ทดสอบ 2 ชั้น" "$N"
+
+  local a1; a1="$(dig +short +time=2 +tries=1 @127.0.0.1 "$probe" 2>/dev/null | head -1)"
+  if [ -n "$a1" ]; then ok "ชั้น dnsmasq  $probe → $a1"
+  else err "ชั้น dnsmasq  ไม่ตอบ — zone ไม่ถูกโหลด (restart แล้วหรือยัง?)"; fi
+
+  local a2; a2="$(dscacheutil -q host -a name "$probe" 2>/dev/null | awk '/^ip_address/{print $2; exit}')"
+  if [ -n "$a2" ]; then ok "ชั้นระบบ     $probe → $a2"
+  else
+    err "ชั้นระบบ     ไม่ตอบ — macOS ไม่ได้ส่ง query มาที่ dnsmasq"
+    resolver_for "$domain" >/dev/null || err "             สาเหตุ: ไม่มี /etc/resolver/$(tld_of "$domain")"
+  fi
+  [ -n "$a1" ] && [ -n "$a2" ] && { echo; ok "${B}ใช้งานได้จริง${N} — subdomain ใหม่ใช้ได้ทันทีไม่ต้องตั้งอะไรเพิ่ม"; }
+}
+
+cmd_doctor() {
+  printf "%s%s%s\n" "$B" "═══ dnsdev doctor ═══" "$N"
+  info "prefix: $PREFIX   ($(uname -m))"
+  echo
+
+  pgrep -f "$PREFIX/.*dnsmasq" >/dev/null \
+    && ok "dnsmasq กำลังรัน (pid $(pgrep -f "$PREFIX/.*dnsmasq" | head -1))" \
+    || err "dnsmasq ไม่ได้รัน —  sudo brew services start dnsmasq"
+
+  syntax_ok && ok "config syntax ผ่าน" || err "config syntax ผิด —  $BIN --test -C $CONF"
+
+  grep -qE '^\s*conf-dir=' "$CONF" \
+    && ok "conf-dir ชี้ไป dnsmasq.d/ แล้ว" \
+    || err "$CONF ไม่มี conf-dir= — ไฟล์ใน dnsmasq.d/ จะไม่ถูกอ่านเลย"
+  echo
+
+  printf "%s%s%s\n" "$B" "── zones ──" "$N"; cmd_ls
+  echo
+
+  printf "%s%s%s\n" "$B" "── /etc/resolver ที่ไม่มี zone รองรับ ──" "$N"
+  local orphan=0
+  shopt -s nullglob
+  for rf in "$RESOLVER"/*; do
+    local name; name="$(basename "$rf")"
+    if ! grep -hoE '^address=/[^/]+/' "$ZONED"/*.conf 2>/dev/null \
+         | sed 's|^address=/||; s|/$||' | grep -qE "(^|\.)$(echo "$name" | sed 's/\./\\./g')$"; then
+      warn "$name — query จะวิ่งไป dnsmasq แล้ว forward ออก internet เปล่า ๆ (ทำให้ช้า)"
+      orphan=1
+    fi
+  done
+  [ $orphan -eq 0 ] && ok "ไม่มี resolver กำพร้า"
+  echo
+
+  printf "%s%s%s\n" "$B" "── /etc/hosts ที่ทับ zone ──" "$N"
+  local conflict=0
+  while IFS= read -r d; do
+    local s; s="$(hosts_shadow "$d")"
+    [ -n "$s" ] && { warn "$d ถูกทับโดย: $(echo "$s" | tr '\n' ' ')"; conflict=1; }
+  done < <(grep -hoE '^address=/[^/]+/' "$ZONED"/*.conf 2>/dev/null | sed 's|^address=/||; s|/$||')
+  [ $conflict -eq 0 ] && ok "ไม่มี /etc/hosts ทับ zone ไหน"
+}
+
+usage() {
+  cat <<EOF
+${B}dnsdev${N} — จัดการ local dev DNS ให้จบในคำสั่งเดียว
+
+  ${B}dnsdev add${N} <domain> [ip]   เพิ่ม wildcard zone (default 127.0.0.1)
+                                สร้าง /etc/resolver ให้ด้วยถ้ายังไม่มี แล้ว restart
+  ${B}dnsdev rm${N} <domain>         ลบ zone (ลบ resolver ให้ถ้าไม่มีใครใช้ TLD นั้นแล้ว)
+  ${B}dnsdev ls${N}                  ดู zone ทั้งหมด + สถานะ resolver ของแต่ละอัน
+  ${B}dnsdev test${N} <domain>       ทดสอบ 2 ชั้น ด้วย subdomain สุ่ม
+  ${B}dnsdev doctor${N}              ตรวจทั้งระบบ หา resolver กำพร้า / hosts ที่ทับ zone
+  ${B}dnsdev restart${N}             restart dnsmasq + flush cache
+
+${D}ตัวอย่าง${N}
+  dnsdev add myapp.test                 → *.myapp.test ทุกชั้น ชี้ 127.0.0.1
+  dnsdev add vm.foo.test 10.100.0.9     → กฎยาวกว่าชนะ wildcard เสมอ
+  dnsdev add db.lab.test 192.168.47.151
+
+${D}เพิ่ม subdomain ของ zone ที่มีอยู่แล้ว (เช่น api.myapp.test)
+ไม่ต้องทำอะไรเลย wildcard ครอบให้แล้ว${N}
+EOF
+}
+
+case "${1:-}" in
+  add)     shift; cmd_add "$@";;
+  rm|del|remove) shift; cmd_rm "$@";;
+  ls|list) cmd_ls;;
+  test|check) shift; cmd_test "$@";;
+  doctor|status) cmd_doctor;;
+  restart|reload) reload;;
+  -h|--help|help|"") usage;;
+  *) err "ไม่รู้จักคำสั่ง: $1"; echo; usage; exit 1;;
+esac
