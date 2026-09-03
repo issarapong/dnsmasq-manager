@@ -6,6 +6,16 @@
 `/etc/resolver/<tld>` ของ macOS ถ้าลืมอย่างหลัง dnsmasq จะตอบถูกทุกอย่างแต่ระบบ
 ไม่เคยส่ง query มาให้เลย และ `dig` ธรรมดาก็ไม่ฟ้อง เพราะมันข้าม resolver ของระบบ
 
+## ดาวน์โหลด
+
+[dnsdev 1.1](https://github.com/issarapong/dnsmasq-manager/releases/latest) — universal
+(Intel + Apple Silicon), macOS 14+ เซ็นแบบ ad-hoc ไม่ได้ notarize ต้องปลด quarantine
+หนึ่งครั้งหลังแตกไฟล์:
+
+```
+xattr -dr com.apple.quarantine ~/Applications/dnsdev.app
+```
+
 ## สามหน้าเหมือนกัน เลือกใช้ตามสะดวก
 
 | | ที่อยู่ | รัน |
