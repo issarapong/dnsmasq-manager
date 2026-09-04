@@ -272,14 +272,21 @@ AGENT_PLIST="$HOME/Library/LaunchAgents/$AGENT_LABEL.plist"
 DAEMON_INSTALLED="$HOME/.local/libexec/dnsdevd"
 PROXY_LOG="$STATE/proxy.log"
 
-# หา dnsdevd: ตัวที่ติดตั้งแล้วมาก่อน แล้วค่อยไล่หาในรีโป (ตอน dev)
-find_daemon() {
-  local self here
-  self="$(cd "$(dirname "$0")" && pwd)"
-  for c in "$DAEMON_INSTALLED" "$self/../proxy/dnsdevd" "$self/proxy/dnsdevd"; do
-    [ -x "$c" ] && { cd "$(dirname "$c")" && echo "$PWD/$(basename "$c")"; return 0; }
+# แหล่งไบนารีสำหรับ "ติดตั้ง" — ห้ามนับตัวที่ติดตั้งไปแล้ว ไม่งั้นจะ copy ทับตัวเอง
+# แล้วอัปเดตเป็นเวอร์ชันใหม่ไม่ได้เลยตลอดกาล
+daemon_source() {
+  local self; self="$(cd "$(dirname "$0")" && pwd)"
+  for c in "$self/../proxy/dnsdevd" "$self/proxy/dnsdevd" \
+           "$HOME/Applications/dnsdev.app/Contents/MacOS/dnsdevd"; do
+    [ -x "$c" ] && { (cd "$(dirname "$c")" && echo "$PWD/$(basename "$c")"); return 0; }
   done
   return 1
+}
+
+# ตัวไหนก็ได้ที่เรียกได้ ใช้ตอนแค่ต้องการให้มันสร้าง CA
+find_daemon() {
+  [ -x "$DAEMON_INSTALLED" ] && { echo "$DAEMON_INSTALLED"; return 0; }
+  daemon_source
 }
 
 py() { /usr/bin/env python3 "$@"; }
@@ -383,7 +390,7 @@ cmd_proxy() {
 }
 
 proxy_install() {
-  local src; src="$(find_daemon)" || {
+  local src; src="$(daemon_source)" || {
     err "หา dnsdevd ไม่เจอ — build ก่อนด้วย  app/build.sh"; return 1; }
 
   local https http; read -r https http <<<"$(proxy_ports)"
@@ -396,9 +403,13 @@ proxy_install() {
   fi
 
   mkdir -p "$(dirname "$DAEMON_INSTALLED")" "$STATE" "$HOME/Library/LaunchAgents"
+  # หยุดก่อนเขียนทับ — เขียนทับไบนารีที่กำลังรันอยู่จะได้ "Text file busy"
+  launchctl bootout "gui/$UID/$AGENT_LABEL" 2>/dev/null
+  rm -f "$DAEMON_INSTALLED"
   # คัดลอกจริง ไม่ทำ symlink — ถ้ารีโปอยู่บนวอลุมที่ไม่ได้ mount launchd จะหาไม่เจอ
-  cp -f "$src" "$DAEMON_INSTALLED" && chmod 755 "$DAEMON_INSTALLED"
-  ok "ติดตั้ง dnsdevd: $DAEMON_INSTALLED"
+  cp "$src" "$DAEMON_INSTALLED" && chmod 755 "$DAEMON_INSTALLED" \
+    || { err "คัดลอก dnsdevd ไม่สำเร็จ"; return 1; }
+  ok "ติดตั้ง dnsdevd: $DAEMON_INSTALLED  ($(cd "$(dirname "$src")" && pwd)/$(basename "$src"))"
 
   cat > "$AGENT_PLIST" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
@@ -416,7 +427,6 @@ proxy_install() {
 </dict>
 </plist>
 PLIST
-  launchctl bootout "gui/$UID/$AGENT_LABEL" 2>/dev/null
   if launchctl bootstrap "gui/$UID" "$AGENT_PLIST" 2>/dev/null; then
     ok "LaunchAgent: $AGENT_PLIST"
   else

@@ -319,6 +319,7 @@ final class Proxy {
         for r in new.routes {
             log("  \(r.host) → \(r.to)\(r.passthrough ? "  [passthrough]" : "")")
         }
+        watchFile()
     }
 
     /// ให้แน่ใจว่า cert ครอบชื่อนี้แล้ว คืนพอร์ตของ TLS listener ที่ใช้ได้
@@ -361,27 +362,52 @@ final class Proxy {
         lock.unlock()
     }
 
-    /// เฝ้าโฟลเดอร์ ไม่ใช่ไฟล์ — editor/CLI ส่วนใหญ่เขียนไฟล์ใหม่แล้ว rename ทับ
-    /// ถ้าจับที่ตัวไฟล์ fd จะชี้ไปยัง inode เก่าที่ไม่มีใครใช้แล้ว
+    /// ต้องเฝ้าทั้งโฟลเดอร์และตัวไฟล์ ไม่ใช่อย่างใดอย่างหนึ่ง:
+    ///
+    /// - โฟลเดอร์เห็นการสร้าง/เปลี่ยนชื่อ/ลบ — คือท่าที่ CLI, แอป และเว็บใช้
+    ///   (เขียนไฟล์ชั่วคราวแล้ว rename ทับ) ซึ่งเปลี่ยน inode ทุกครั้ง
+    /// - ตัวไฟล์เห็นการเขียนทับ inode เดิม — คือท่าที่ editor กับ `echo >` ใช้
+    ///   ซึ่งไม่แตะสารบัญของโฟลเดอร์เลย ถ้าเฝ้าแต่โฟลเดอร์จะเงียบสนิท
     private func watch() {
         try? FileManager.default.createDirectory(at: stateDir, withIntermediateDirectories: true)
         let fd = open(stateDir.path, O_EVTONLY)
         guard fd >= 0 else { log("เฝ้า \(stateDir.path) ไม่ได้"); return }
         let src = DispatchSource.makeFileSystemObjectSource(
             fileDescriptor: fd, eventMask: [.write, .rename, .delete], queue: q)
-        var pending: DispatchWorkItem?
-        src.setEventHandler {
-            pending?.cancel()
-            let w = DispatchWorkItem { [weak self] in self?.reload() }
-            pending = w
-            // หน่วงสั้น ๆ กัน reload ซ้ำตอนเขียนไฟล์แบบหลายจังหวะ
-            self.q.asyncAfter(deadline: .now() + 0.3, execute: w)
-        }
+        src.setEventHandler { [weak self] in self?.scheduleReload() }
         src.setCancelHandler { close(fd) }
         src.resume()
         watcher = src
+        watchFile()
     }
+
+    /// ผูกใหม่ทุกครั้งหลัง reload — การเขียนแบบ atomic เปลี่ยน inode
+    /// fd เดิมจะค้างชี้ไฟล์เก่าที่ไม่มีใครใช้แล้ว
+    private func watchFile() {
+        fileWatcher?.cancel()
+        fileWatcher = nil
+        let fd = open(routesFile.path, O_EVTONLY)
+        guard fd >= 0 else { return }   // ยังไม่มีไฟล์ — โฟลเดอร์จะเห็นตอนถูกสร้าง
+        let src = DispatchSource.makeFileSystemObjectSource(
+            fileDescriptor: fd, eventMask: [.write, .extend, .rename, .delete], queue: q)
+        src.setEventHandler { [weak self] in self?.scheduleReload() }
+        src.setCancelHandler { close(fd) }
+        src.resume()
+        fileWatcher = src
+    }
+
+    /// หน่วงสั้น ๆ กัน reload ซ้ำ — ทั้งจากการเขียนหลายจังหวะ และจากการที่
+    /// การเขียนครั้งเดียวปลุกทั้ง watcher ของโฟลเดอร์และของไฟล์พร้อมกัน
+    private func scheduleReload() {
+        pendingReload?.cancel()
+        let w = DispatchWorkItem { [weak self] in self?.reload() }
+        pendingReload = w
+        q.asyncAfter(deadline: .now() + 0.3, execute: w)
+    }
+
     private var watcher: DispatchSourceFileSystemObject?
+    private var fileWatcher: DispatchSourceFileSystemObject?
+    private var pendingReload: DispatchWorkItem?
 
     // MARK: listeners
     private func makeListener(host: String, port: UInt16,
