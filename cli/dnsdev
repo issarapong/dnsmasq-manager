@@ -89,9 +89,19 @@ reload() {
 # ---------- commands ----------
 
 cmd_add() {
-  local domain="${1:-}" ip="${2:-127.0.0.1}"
-  [ -z "$domain" ] && { err "ต้องระบุโดเมน:  dnsdev add <domain> [ip]"; exit 1; }
+  local mode="terminate"
+  [ "${1:-}" = "--pass" ] && { mode="passthrough"; shift; }
+  local domain="${1:-}" target="${2:-}"
+  [ -z "$domain" ] && { err "ต้องระบุโดเมน:  dnsdev add <domain> [port|ip|host:port]"; exit 1; }
   domain="${domain#.}"; domain="${domain%.}"
+
+  # เลข = พอร์ต, IP = ชี้ DNS ตรง ๆ เหมือนเดิม, host:port = ให้ proxy ส่งต่อ
+  local kind dest ip route_to=""
+  read -r kind dest <<<"$(classify_target "$target")"
+  [ "$kind" = "invalid" ] && { err "ไม่เข้าใจปลายทาง: $target"; exit 1; }
+  if [ "$kind" = "proxy" ]; then ip="127.0.0.1"; route_to="$dest"; else ip="$dest"; fi
+  [ "$mode" = "passthrough" ] && [ -z "$route_to" ] && {
+    err "--pass ต้องบอกปลายทางด้วย เช่น:  dnsdev add --pass vm.test 127.0.0.1:8443"; exit 1; }
 
   check_tld "$domain" || exit 1
 
@@ -125,6 +135,17 @@ EOF
     warn "ลบออกด้วย:  sudo sed -i '' '/$(echo "$domain" | sed 's/\./\\./g')/d' /etc/hosts"
   fi
 
+  if [ -n "$route_to" ]; then
+    routes_edit "$domain" "$route_to" "$mode"
+    if [ "$mode" = "passthrough" ]; then
+      ok "proxy:    https://$domain → $route_to  (passthrough — ปลายทางถือ cert เอง)"
+    else
+      ok "proxy:    https://$domain → $route_to"
+      info "          subdomain ทุกชั้นใช้ปลายทางเดียวกัน ไม่ต้องเพิ่มอีก"
+    fi
+    proxy_running || warn "          แต่ dnsdevd ยังไม่ได้รัน — 'dnsdev proxy install'"
+  fi
+
   echo
   reload && { echo; cmd_test "$domain"; }
 }
@@ -136,6 +157,9 @@ cmd_rm() {
   [ -f "$zf" ] || { err "ไม่มี zone นี้: $domain"; exit 1; }
 
   rm -f "$zf" && ok "ลบ zone: $zf"
+  if route_of "$domain" >/dev/null 2>&1; then
+    routes_edit "$domain" "" ""; ok "ลบ route ของ proxy ด้วย"
+  fi
 
   # ลบ resolver ก็ต่อเมื่อไม่มี zone ไหนใช้ TLD นี้แล้ว
   local tld; tld="$(tld_of "$domain")"
@@ -157,17 +181,22 @@ cmd_ls() {
     info "ยังไม่มี zone — เพิ่มด้วย:  dnsdev add foo.test"
     return
   fi
-  printf "%s%-34s %-16s %s%s\n" "$B" "DOMAIN" "→ IP" "RESOLVER" "$N"
+  printf "%s%-30s %-14s %-22s %s%s\n" "$B" "DOMAIN" "→ IP" "PROXY (https)" "RESOLVER" "$N"
   for f in "${files[@]}"; do
     while IFS= read -r line; do
-      local d ip rs
+      local d ip rs rt to md px
       d="$(echo "$line" | sed 's|^address=/||; s|/[^/]*$||')"
       ip="$(echo "$line" | sed 's|.*/||')"
-      if rs="$(resolver_for "$d")"; then rs="${G}/etc/resolver/$rs${N}"
-      else rs="${R}ไม่มี — จะใช้ไม่ได้!${N}"; fi
-      printf "%-34s %-16s %b\n" "$d" "$ip" "$rs"
+      if rs="$(resolver_for "$d")"; then rs="${G}resolver/$rs${N}"
+      else rs="${R}ไม่มี — ใช้ไม่ได้!${N}"; fi
+      if rt="$(route_of "$d" 2>/dev/null)"; then
+        to="${rt%%	*}"; md="${rt##*	}"
+        [ "$md" = "passthrough" ] && px="$to ${D}(pass)${N}" || px="$to"
+      else px="${D}—${N}"; fi
+      printf "%-30s %-14s %-22b %b\n" "$d" "$ip" "$px" "$rs"
     done < <(grep -hE '^address=/' "$f" 2>/dev/null)
   done
+  proxy_running || { echo; info "dnsdevd ไม่ได้รัน — คอลัมน์ PROXY ยังไม่มีผล ('dnsdev proxy install')"; }
 }
 
 cmd_test() {
@@ -232,25 +261,263 @@ cmd_doctor() {
   [ $conflict -eq 0 ] && ok "ไม่มี /etc/hosts ทับ zone ไหน"
 }
 
+# ---------- ชั้น proxy (https ไม่ต้องพิมพ์พอร์ต) ----------
+# DNS อย่างเดียวพาไปได้แค่ "โดเมนนี้คือเครื่องไหน" ยังต้องพิมพ์ :3000 อยู่ดี
+# ชั้นนี้คือ dnsdevd — ฟัง :443 แล้วส่งต่อตามชื่อ พร้อมออก cert ให้เอง
+STATE="$HOME/.config/dnsdev"
+ROUTES="$STATE/routes.json"
+CA_PEM="$STATE/ca/ca.pem"
+AGENT_LABEL="local.dnsdev.proxy"
+AGENT_PLIST="$HOME/Library/LaunchAgents/$AGENT_LABEL.plist"
+DAEMON_INSTALLED="$HOME/.local/libexec/dnsdevd"
+PROXY_LOG="$STATE/proxy.log"
+
+# หา dnsdevd: ตัวที่ติดตั้งแล้วมาก่อน แล้วค่อยไล่หาในรีโป (ตอน dev)
+find_daemon() {
+  local self here
+  self="$(cd "$(dirname "$0")" && pwd)"
+  for c in "$DAEMON_INSTALLED" "$self/../proxy/dnsdevd" "$self/proxy/dnsdevd"; do
+    [ -x "$c" ] && { cd "$(dirname "$c")" && echo "$PWD/$(basename "$c")"; return 0; }
+  done
+  return 1
+}
+
+py() { /usr/bin/env python3 "$@"; }
+
+routes_edit() {   # routes_edit <host> <to|""> <mode>   — to ว่าง = ลบ
+  mkdir -p "$STATE"
+  DNSDEV_HOST="$1" DNSDEV_TO="$2" DNSDEV_MODE="$3" DNSDEV_FILE="$ROUTES" py - <<'PY'
+import json, os, tempfile
+f = os.environ["DNSDEV_FILE"]
+host, to, mode = os.environ["DNSDEV_HOST"], os.environ["DNSDEV_TO"], os.environ["DNSDEV_MODE"]
+try:
+    with open(f) as fh: cfg = json.load(fh)
+except Exception:
+    cfg = {}
+cfg.setdefault("https", 443)
+cfg.setdefault("http", 80)
+routes = [r for r in cfg.get("routes", []) if r.get("host") != host]
+if to:
+    r = {"host": host, "to": to}
+    if mode == "passthrough": r["mode"] = "passthrough"
+    routes.append(r)
+cfg["routes"] = sorted(routes, key=lambda r: r["host"])
+# เขียนใหม่แล้ว rename ทับ — daemon เฝ้าโฟลเดอร์อยู่ จะเห็นครั้งเดียวจบ
+d = os.path.dirname(f) or "."
+os.makedirs(d, exist_ok=True)
+fd, tmp = tempfile.mkstemp(dir=d)
+with os.fdopen(fd, "w") as fh: json.dump(cfg, fh, indent=2, ensure_ascii=False); fh.write("\n")
+os.replace(tmp, f)
+PY
+}
+
+route_of() {      # route_of <host> -> "to<TAB>mode" ถ้ามี
+  [ -f "$ROUTES" ] || return 1
+  DNSDEV_HOST="$1" DNSDEV_FILE="$ROUTES" py - <<'PY'
+import json, os, sys
+try:
+    with open(os.environ["DNSDEV_FILE"]) as fh: cfg = json.load(fh)
+except Exception: sys.exit(1)
+for r in cfg.get("routes", []):
+    if r.get("host") == os.environ["DNSDEV_HOST"]:
+        print("%s\t%s" % (r.get("to", ""), r.get("mode", "terminate"))); sys.exit(0)
+sys.exit(1)
+PY
+}
+
+proxy_running() { pgrep -qf "$DAEMON_INSTALLED" 2>/dev/null; }
+
+proxy_ports() {   # อ่านพอร์ตจาก config (default 443/80)
+  DNSDEV_FILE="$ROUTES" py - <<'PY'
+import json, os
+try:
+    with open(os.environ["DNSDEV_FILE"]) as fh: cfg = json.load(fh)
+except Exception: cfg = {}
+print("%s %s" % (cfg.get("https", 443), cfg.get("http", 80)))
+PY
+}
+
+# แปลง argument ตัวที่สองของ add ให้รู้ว่าหมายถึงอะไร
+# 3000            -> proxy ไป 127.0.0.1:3000
+# 10.0.0.9        -> DNS ชี้ IP นั้นตรง ๆ (พฤติกรรมเดิม)
+# 10.0.0.9:8080   -> proxy ไปที่นั่น
+is_port() { case "$1" in ""|*[!0-9]*) return 1;; esac; [ "$1" -ge 1 ] && [ "$1" -le 65535 ]; }
+
+is_ipv4() {
+  local IFS=. o n=0
+  case "$1" in ""|*[!0-9.]*|*..*|.*|*.) return 1;; esac
+  for o in $1; do
+    [ "${#o}" -gt 3 ] && return 1
+    [ "$o" -gt 255 ] && return 1
+    n=$((n+1))
+  done
+  [ "$n" -eq 4 ]
+}
+
+classify_target() {
+  local t="$1"
+  [ -z "$t" ] && { echo "dns 127.0.0.1"; return; }
+  is_port "$t" && { echo "proxy 127.0.0.1:$t"; return; }
+  case "$t" in
+    *:*)
+      # ปล่อยให้ผ่านทั้งที่พอร์ตไม่ใช่ตัวเลข = เขียน routes.json เสียแบบเงียบ ๆ
+      is_port "${t##*:}" && [ -n "${t%:*}" ] && { echo "proxy $t"; return; }
+      echo "invalid"; return;;
+  esac
+  is_ipv4 "$t" && { echo "dns $t"; return; }
+  echo "invalid"
+}
+
+cmd_proxy() {
+  case "${1:-status}" in
+    install)  proxy_install;;
+    uninstall) proxy_uninstall;;
+    start)    launchctl kickstart -k "gui/$UID/$AGENT_LABEL" 2>/dev/null && ok "สั่ง start แล้ว" \
+                || err "ยังไม่ได้ติดตั้ง — รัน 'dnsdev proxy install' ก่อน";;
+    stop)     launchctl bootout "gui/$UID/$AGENT_LABEL" 2>/dev/null && ok "หยุดแล้ว" \
+                || warn "ไม่ได้รันอยู่";;
+    log)      [ -f "$PROXY_LOG" ] && tail -n "${2:-40}" "$PROXY_LOG" || info "ยังไม่มี log";;
+    status)   proxy_status;;
+    *)        err "ไม่รู้จัก: dnsdev proxy $1"; return 1;;
+  esac
+}
+
+proxy_install() {
+  local src; src="$(find_daemon)" || {
+    err "หา dnsdevd ไม่เจอ — build ก่อนด้วย  app/build.sh"; return 1; }
+
+  local https http; read -r https http <<<"$(proxy_ports)"
+  local holder
+  holder="$(lsof -nP -iTCP:"$https" -sTCP:LISTEN 2>/dev/null | awk 'NR==2{print $1" (pid "$2")"}')"
+  if [ -n "$holder" ] && ! proxy_running; then
+    err ":$https ถูก $holder ยึดอยู่ — dnsdevd จะผูกไม่ได้"
+    info "ย้ายตัวนั้นไปพอร์ตอื่น หรือให้ dnsdev ใช้พอร์ตอื่นโดยแก้ \"https\" ใน $ROUTES"
+    return 1
+  fi
+
+  mkdir -p "$(dirname "$DAEMON_INSTALLED")" "$STATE" "$HOME/Library/LaunchAgents"
+  # คัดลอกจริง ไม่ทำ symlink — ถ้ารีโปอยู่บนวอลุมที่ไม่ได้ mount launchd จะหาไม่เจอ
+  cp -f "$src" "$DAEMON_INSTALLED" && chmod 755 "$DAEMON_INSTALLED"
+  ok "ติดตั้ง dnsdevd: $DAEMON_INSTALLED"
+
+  cat > "$AGENT_PLIST" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key><string>$AGENT_LABEL</string>
+	<key>ProgramArguments</key>
+	<array><string>$DAEMON_INSTALLED</string></array>
+	<key>RunAtLoad</key><true/>
+	<key>KeepAlive</key><true/>
+	<key>StandardOutPath</key><string>$PROXY_LOG</string>
+	<key>StandardErrorPath</key><string>$PROXY_LOG</string>
+	<key>ProcessType</key><string>Interactive</string>
+</dict>
+</plist>
+PLIST
+  launchctl bootout "gui/$UID/$AGENT_LABEL" 2>/dev/null
+  if launchctl bootstrap "gui/$UID" "$AGENT_PLIST" 2>/dev/null; then
+    ok "LaunchAgent: $AGENT_PLIST"
+  else
+    err "bootstrap ไม่สำเร็จ"; return 1
+  fi
+  sleep 1
+  echo; proxy_status
+  echo
+  if ! ca_trusted; then
+    warn "CA ยังไม่ถูกเชื่อถือ — browser จะขึ้นเตือน cert"
+    info "รัน:  dnsdev trust"
+  fi
+}
+
+proxy_uninstall() {
+  launchctl bootout "gui/$UID/$AGENT_LABEL" 2>/dev/null && ok "หยุด agent แล้ว" || info "ไม่ได้รันอยู่"
+  rm -f "$AGENT_PLIST" && ok "ลบ $AGENT_PLIST"
+  rm -f "$DAEMON_INSTALLED" && ok "ลบ $DAEMON_INSTALLED"
+  info "CA กับ routes.json ยังอยู่ที่ $STATE — ลบเองได้ถ้าไม่ใช้แล้ว"
+}
+
+proxy_status() {
+  local https http; read -r https http <<<"$(proxy_ports)"
+  if proxy_running; then
+    ok "dnsdevd ทำงานอยู่  (pid $(pgrep -f "$DAEMON_INSTALLED" | head -1))"
+  else
+    [ -f "$AGENT_PLIST" ] && err "ติดตั้งแล้วแต่ไม่ได้รัน — ดู 'dnsdev proxy log'" \
+                          || info "ยังไม่ได้ติดตั้ง — 'dnsdev proxy install'"
+  fi
+  local n=0
+  [ -f "$ROUTES" ] && n="$(DNSDEV_FILE="$ROUTES" py -c 'import json,os;print(len(json.load(open(os.environ["DNSDEV_FILE"])).get("routes",[])))' 2>/dev/null || echo 0)"
+  info "ฟัง https :$https · http :$http · $n route"
+  ca_trusted && ok "CA เชื่อถือแล้ว (System keychain)" || warn "CA ยังไม่ถูกเชื่อถือ — 'dnsdev trust'"
+}
+
+ca_trusted() {
+  [ -f "$CA_PEM" ] || return 1
+  # เทียบด้วย fingerprint — ชื่อ CA ซ้ำกันได้ แต่ลายนิ้วมือไม่ซ้ำ
+  local fp
+  fp="$(/usr/bin/openssl x509 -in "$CA_PEM" -noout -fingerprint -sha1 2>/dev/null | cut -d= -f2 | tr -d ':')"
+  [ -n "$fp" ] || return 1
+  security find-certificate -a -Z /Library/Keychains/System.keychain 2>/dev/null \
+    | grep -q "SHA-1 hash: $fp"
+}
+
+ensure_ca() {
+  [ -f "$CA_PEM" ] && return 0
+  local d; d="$(find_daemon)" || { err "หา dnsdevd ไม่เจอ — build ก่อน"; return 1; }
+  "$d" --ensure-ca >/dev/null || return 1
+}
+
+cmd_trust() {
+  ensure_ca || return 1
+  if ca_trusted; then ok "CA ถูกเชื่อถืออยู่แล้ว"; return 0; fi
+  info "จะเพิ่ม CA ของ dnsdev เข้า System keychain — ต้องใส่รหัสผ่าน"
+  info "  $CA_PEM"
+  if sudo security add-trusted-cert -d -r trustRoot -p ssl \
+       -k /Library/Keychains/System.keychain "$CA_PEM"; then
+    ok "เชื่อถือแล้ว — https://<โดเมนของคุณ> จะไม่ขึ้นเตือนอีก"
+  else
+    err "เพิ่มไม่สำเร็จ"; return 1
+  fi
+}
+
+cmd_untrust() {
+  [ -f "$CA_PEM" ] || { err "ไม่มี $CA_PEM"; return 1; }
+  sudo security remove-trusted-cert -d "$CA_PEM" 2>/dev/null \
+    && ok "เอา CA ออกจาก trust store แล้ว" || err "เอาออกไม่สำเร็จ"
+}
+
 usage() {
   cat <<EOF
 ${B}dnsdev${N} — จัดการ local dev DNS ให้จบในคำสั่งเดียว
 
-  ${B}dnsdev add${N} <domain> [ip]   เพิ่ม wildcard zone (default 127.0.0.1)
-                                สร้าง /etc/resolver ให้ด้วยถ้ายังไม่มี แล้ว restart
-  ${B}dnsdev rm${N} <domain>         ลบ zone (ลบ resolver ให้ถ้าไม่มีใครใช้ TLD นั้นแล้ว)
-  ${B}dnsdev ls${N}                  ดู zone ทั้งหมด + สถานะ resolver ของแต่ละอัน
+  ${B}dnsdev add${N} <domain> [ปลายทาง]  เพิ่ม wildcard zone + route ของ proxy
+  ${B}dnsdev rm${N} <domain>         ลบ zone + route (ลบ resolver ถ้าไม่มีใครใช้ TLD แล้ว)
+  ${B}dnsdev ls${N}                  ดูทุกโดเมน ทั้งชั้น DNS และชั้น proxy
   ${B}dnsdev test${N} <domain>       ทดสอบ 2 ชั้น ด้วย subdomain สุ่ม
   ${B}dnsdev doctor${N}              ตรวจทั้งระบบ หา resolver กำพร้า / hosts ที่ทับ zone
   ${B}dnsdev restart${N}             restart dnsmasq + flush cache
 
-${D}ตัวอย่าง${N}
-  dnsdev add myapp.test                 → *.myapp.test ทุกชั้น ชี้ 127.0.0.1
-  dnsdev add vm.foo.test 10.100.0.9     → กฎยาวกว่าชนะ wildcard เสมอ
-  dnsdev add db.lab.test 192.168.47.151
+${B}ชั้น https${N} (ไม่ต้องพิมพ์พอร์ต)
+  ${B}dnsdev proxy install${N}       ติดตั้ง dnsdevd เป็น LaunchAgent แล้วเริ่มรัน
+  ${B}dnsdev proxy status${N}        ดูว่ารันอยู่ไหม ฟังพอร์ตอะไร CA เชื่อถือหรือยัง
+  ${B}dnsdev proxy log${N} [n]       ดู log ของ proxy
+  ${B}dnsdev proxy stop|start${N}    หยุด / เริ่มใหม่
+  ${B}dnsdev proxy uninstall${N}     ถอด LaunchAgent ออก
+  ${B}dnsdev trust${N}               เพิ่ม CA เข้า System keychain (ครั้งเดียว ต้องใส่รหัส)
+  ${B}dnsdev untrust${N}             เอา CA ออกจาก trust store
+
+${D}ปลายทางของ add ตีความตามรูปแบบ${N}
+  dnsdev add myapp.test 3000            https://myapp.test → 127.0.0.1:3000
+  dnsdev add myapp.test                 DNS อย่างเดียว ชี้ 127.0.0.1
+  dnsdev add vm.foo.test 10.100.0.9     DNS ชี้ IP นั้นตรง ๆ (กฎยาวกว่าชนะเสมอ)
+  dnsdev add api.test 10.100.0.9:8080   proxy ข้ามเครื่องไปพอร์ตนั้น
+  dnsdev add --pass vm.test 127.0.0.1:8443
+                                        ส่ง TLS ดิบต่อ — ปลายทางถือ cert เอง
+                                        (ใช้กับ VM/คอนเทนเนอร์ที่มี cert อยู่แล้ว)
 
 ${D}เพิ่ม subdomain ของ zone ที่มีอยู่แล้ว (เช่น api.myapp.test)
-ไม่ต้องทำอะไรเลย wildcard ครอบให้แล้ว${N}
+ไม่ต้องทำอะไรเลย ทั้ง DNS และ proxy ครอบทุกชั้นให้แล้ว${N}
 EOF
 }
 
@@ -261,6 +528,9 @@ case "${1:-}" in
   test|check) shift; cmd_test "$@";;
   doctor|status) cmd_doctor;;
   restart|reload) reload;;
+  proxy)   shift; cmd_proxy "$@";;
+  trust)   cmd_trust;;
+  untrust) cmd_untrust;;
   -h|--help|help|"") usage;;
   *) err "ไม่รู้จักคำสั่ง: $1"; echo; usage; exit 1;;
 esac

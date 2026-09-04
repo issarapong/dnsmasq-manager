@@ -2,6 +2,7 @@
 /app/dnsdev
 /app/dnsdev-arm64
 /app/dnsdev-x86_64
+/proxy/dnsdevd
 .build/
 build/
 .DS_Store

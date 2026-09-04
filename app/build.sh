@@ -9,11 +9,21 @@ cd "$(dirname "$0")"
 APP="$HOME/Applications/dnsdev.app"
 MIN="14.0"
 
-echo "==> compile"
+echo "==> compile app"
 for arch in x86_64 arm64; do
   swiftc -O -parse-as-library -target "$arch-apple-macos$MIN" -o "dnsdev-$arch" App.swift
 done
 lipo -create -output dnsdev dnsdev-x86_64 dnsdev-arm64
+
+# dnsdevd — ตัว proxy ชั้น https  อยู่คนละไบนารีเพราะ launchd ต้องรันมันเดี่ยว ๆ
+# เป็น LaunchAgent ตลอดเวลา ส่วน app เป็นแค่หน้าจอที่เปิด ๆ ปิด ๆ
+echo "==> compile proxy"
+for arch in x86_64 arm64; do
+  swiftc -O -parse-as-library -target "$arch-apple-macos$MIN" \
+    -o "../proxy/dnsdevd-$arch" ../proxy/Proxy.swift
+done
+lipo -create -output ../proxy/dnsdevd ../proxy/dnsdevd-arm64 ../proxy/dnsdevd-x86_64
+rm -f ../proxy/dnsdevd-arm64 ../proxy/dnsdevd-x86_64
 
 echo "==> bundle -> $APP"
 # ปิดตัวที่รันอยู่ก่อน ไม่งั้นเขียนทับ binary ไม่ได้
@@ -22,6 +32,7 @@ sleep 1
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp dnsdev "$APP/Contents/MacOS/dnsdev"
+cp ../proxy/dnsdevd "$APP/Contents/MacOS/dnsdevd"
 cat > "$APP/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
