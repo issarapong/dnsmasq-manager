@@ -74,8 +74,11 @@ app/build.sh          # universal binary + bundle + ad-hoc sign + ติดต�
 - **TLD** — `.test` สงวนตาม RFC 6761 ใช้ตัวนี้ `.local` ใช้ไม่ได้เด็ดขาด (macOS ส่งไป
   mDNSResponder เสมอ) `.dev` อยู่ใน HSTS preload ต้องมี cert
 - **cert ต้องมี SKI/AKI** — ไม่มีแล้ว Safari ผ่านสบายแต่ OpenSSL 3 (Node, Python,
-  curl ที่ลิงก์กับมัน) ปฏิเสธด้วย `Missing Authority Key Identifier` และอายุ leaf
-  ต้องไม่เกิน 398 วัน ไม่งั้น Apple ไม่รับ
+  curl ที่ลิงก์กับมัน) ปฏิเสธด้วย `Missing Authority Key Identifier`
+- **เพดาน 398 วันไม่บังคับกับ CA ของเราเอง** — กฎนั้นใช้กับ cert ที่สืบไปถึง root
+  ที่ติดมากับ OS ส่วน root ที่ผู้ใช้ติดตั้งเองได้รับยกเว้น (mkcert ออกใบอายุ 822 วัน
+  แล้ว macOS ก็ยอมรับ) `dnsdevd` ใช้ 397 วันเพราะไม่มีเหตุต้องยาวกว่านั้น —
+  มันออกใบใหม่ทุกครั้งที่ route เปลี่ยนอยู่แล้ว
 - **wildcard ของ TLS ครอบชั้นเดียว** — `*.myapp.test` ไม่ครอบ `a.b.myapp.test` และ
   `*.*.x` ใช้ไม่ได้ตามสเปค ขณะที่ DNS ฝั่ง dnsmasq ครอบทุกชั้น `dnsdevd` จึงออก cert
   ตาม SNI ที่เห็นจริงแล้ว cache ไว้ ไม่งั้นสัญญา "ทุกชั้น" จะพังที่ชั้น https

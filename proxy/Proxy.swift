@@ -154,7 +154,9 @@ func makeIdentity(sans: [String]) throws -> SecIdentity {
                           "-keyout", key, "-out", csr, "-subj", "/CN=dnsdev"])
     guard r.code == 0 else { throw CertError.failed("สร้าง CSR ไม่สำเร็จ: \(r.out)") }
 
-    // 397 วัน — Apple ปฏิเสธ server cert ที่อายุเกิน 398 วัน
+    // 397 วัน — เพดาน 398 วันของ Apple จริง ๆ ใช้กับ cert ที่สืบไปถึง root ที่ติดมากับ
+    // OS เท่านั้น root ที่ผู้ใช้ติดตั้งเองได้รับยกเว้น แต่ไม่มีเหตุต้องออกยาวกว่านี้
+    // เพราะ leaf ถูกออกใหม่ทุกครั้งที่ route เปลี่ยนอยู่แล้ว
     r = run(OPENSSL, ["x509", "-req", "-in", csr, "-CA", caCert.path, "-CAkey", caKey.path,
                       "-CAcreateserial", "-out", crt, "-days", "397", "-sha256", "-extfile", ext])
     guard r.code == 0 else { throw CertError.failed("เซ็น leaf ไม่สำเร็จ: \(r.out)") }
