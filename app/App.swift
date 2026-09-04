@@ -52,6 +52,40 @@ struct Issue: Identifiable {
     var fix: (() -> Void)?
 }
 
+// ---- ชั้น https (dnsdevd) ----
+
+struct ProxyRoute: Identifiable, Equatable, Sendable {
+    var host: String
+    var to: String
+    var passthrough: Bool
+    var id: String { host }
+
+    /// ปลายทางบนเครื่องเดียวกันย่อเหลือแค่พอร์ต — ":3000" อ่านง่ายกว่า "127.0.0.1:3000"
+    var shortTo: String {
+        let p = to.split(separator: ":")
+        return (p.count == 2 && p[0] == "127.0.0.1") ? ":\(p[1])" : to
+    }
+    var port: String {
+        to.split(separator: ":").last.map(String.init) ?? ""
+    }
+}
+
+struct ProxyState: Sendable {
+    var installed = false
+    var pid: Int?
+    var https: UInt16 = 443
+    var http: UInt16 = 80
+    var routes: [ProxyRoute] = []
+    var caExists = false
+    var caTrusted = false
+    /// ใครยึดพอร์ต https อยู่ ถ้าไม่ใช่ dnsdevd เอง — สาเหตุอันดับหนึ่งที่ proxy ไม่ขึ้น
+    var portHolder: String?
+
+    var running: Bool { pid != nil }
+    var terminates: Bool { routes.contains { !$0.passthrough } }
+    func route(for domain: String) -> ProxyRoute? { routes.first { $0.host == domain } }
+}
+
 /// ผลอ่านสถานะทั้งชุด อ่านนอก main thread แล้วค่อยโยนกลับมาทีเดียว
 struct Snapshot: Sendable {
     var zones: [Zone] = []
@@ -61,6 +95,7 @@ struct Snapshot: Sendable {
     var syntaxMsg = ""
     var confDir = true
     var orphans: [String] = []
+    var proxy = ProxyState()
 }
 
 // MARK: - System glue
@@ -245,6 +280,7 @@ enum Sys {
         (s.syntaxOK, s.syntaxMsg) = syntaxOK()
         s.confDir = hasConfDir()
         s.orphans = orphanResolvers(s.zones)
+        s.proxy = Prox.state()
         return s
     }
 
@@ -262,6 +298,178 @@ enum Sys {
         }
         return Probe(name: name, dnsmasq: d, system: sys)
     }
+}
+
+/// ชั้น https — dnsdevd, CA และ route
+///
+/// ต่างจากชั้น dnsmasq ตรงที่แทบไม่ต้องใช้ root เลย: LaunchAgent เป็นของ user
+/// และ macOS ยอมให้ผูกพอร์ตต่ำกว่า 1024 โดยไม่ต้องเป็น root
+/// เหลืองานเดียวที่ต้องขอรหัส คือเอา CA เข้า System keychain
+enum Prox {
+    static let label = "local.dnsdev.proxy"
+    static var home: String { NSHomeDirectory() }
+    static var stateDir: String { home + "/.config/dnsdev" }
+    static var routesFile: String { stateDir + "/routes.json" }
+    static var caDir: String { stateDir + "/ca" }
+    static var caPem: String { caDir + "/ca.pem" }
+    static var logFile: String { stateDir + "/proxy.log" }
+    static var agentPlist: String { home + "/Library/LaunchAgents/\(label).plist" }
+    static var installedDaemon: String { home + "/.local/libexec/dnsdevd" }
+
+    /// dnsdevd ที่มาพร้อมตัวแอป — build.sh วางไว้ข้าง ๆ ไบนารีหลัก
+    /// ใช้ executableURL ไม่ใช่ bundleURL จะได้ทำงานตอนรันจาก build dir ด้วย
+    static var bundledDaemon: String? {
+        guard let exe = Bundle.main.executableURL else { return nil }
+        let p = exe.deletingLastPathComponent().appendingPathComponent("dnsdevd").path
+        return FileManager.default.isExecutableFile(atPath: p) ? p : nil
+    }
+
+    // ---- reads ----
+
+    static func pid() -> Int? {
+        Sys.run("/usr/bin/pgrep", ["-f", installedDaemon])
+            .out.split(whereSeparator: \.isWhitespace).first.flatMap { Int($0) }
+    }
+
+    static func readRoutes() -> (https: UInt16, http: UInt16, routes: [ProxyRoute]) {
+        guard let d = FileManager.default.contents(atPath: routesFile),
+              let o = (try? JSONSerialization.jsonObject(with: d)) as? [String: Any]
+        else { return (443, 80, []) }
+        let https = (o["https"] as? NSNumber)?.uint16Value ?? 443
+        let http = (o["http"] as? NSNumber)?.uint16Value ?? 80
+        let arr = (o["routes"] as? [[String: Any]]) ?? []
+        let routes = arr.compactMap { r -> ProxyRoute? in
+            guard let h = r["host"] as? String, let t = r["to"] as? String else { return nil }
+            return ProxyRoute(host: h, to: t, passthrough: (r["mode"] as? String) == "passthrough")
+        }
+        return (https, http, routes.sorted { $0.host < $1.host })
+    }
+
+    /// เขียนแล้ว rename ทับ — dnsdevd เฝ้าโฟลเดอร์อยู่ จะเห็นการเปลี่ยนครั้งเดียวจบ
+    static func writeRoutes(https: UInt16, http: UInt16, _ routes: [ProxyRoute]) throws {
+        try FileManager.default.createDirectory(atPath: stateDir, withIntermediateDirectories: true)
+        var body: [String: Any] = ["https": Int(https), "http": Int(http)]
+        body["routes"] = routes.sorted { $0.host < $1.host }.map { r -> [String: Any] in
+            var e: [String: Any] = ["host": r.host, "to": r.to]
+            if r.passthrough { e["mode"] = "passthrough" }
+            return e
+        }
+        let d = try JSONSerialization.data(withJSONObject: body,
+                                           options: [.prettyPrinted, .sortedKeys])
+        // .atomic เขียนไฟล์ชั่วคราวในโฟลเดอร์เดียวกันแล้ว rename ทับให้เอง
+        // ได้ทั้งความอะตอมมิกและสร้างไฟล์ใหม่ได้ตอนยังไม่มี (replaceItemAt ทำอย่างหลังไม่ได้)
+        try d.write(to: URL(fileURLWithPath: routesFile), options: .atomic)
+    }
+
+    /// เทียบด้วย fingerprint ไม่ใช่ชื่อ — ชื่อ CA ซ้ำกันได้ ลายนิ้วมือไม่ซ้ำ
+    static func caTrusted() -> Bool {
+        guard FileManager.default.fileExists(atPath: caPem) else { return false }
+        let fp = Sys.run("/usr/bin/openssl",
+                         ["x509", "-in", caPem, "-noout", "-fingerprint", "-sha1"])
+            .out.split(separator: "=").last?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .replacingOccurrences(of: ":", with: "")
+        guard let fp, !fp.isEmpty else { return false }
+        return Sys.run("/usr/bin/security",
+                       ["find-certificate", "-a", "-Z", "/Library/Keychains/System.keychain"])
+            .out.contains("SHA-1 hash: " + fp)
+    }
+
+    static func portHolder(_ port: UInt16, ours: Int?) -> String? {
+        let r = Sys.run("/usr/sbin/lsof", ["-nP", "-iTCP:\(port)", "-sTCP:LISTEN"])
+        for line in r.out.split(separator: "\n").dropFirst() {
+            let f = line.split(whereSeparator: \.isWhitespace)
+            guard f.count > 1, let p = Int(f[1]) else { continue }
+            if let ours, p == ours { return nil }
+            return "\(f[0]) (pid \(p))"
+        }
+        return nil
+    }
+
+    static func state() -> ProxyState {
+        var s = ProxyState()
+        s.installed = FileManager.default.fileExists(atPath: agentPlist)
+        s.pid = pid()
+        (s.https, s.http, s.routes) = readRoutes()
+        s.caExists = FileManager.default.fileExists(atPath: caPem)
+        s.caTrusted = caTrusted()
+        s.portHolder = portHolder(s.https, ours: s.pid)
+        return s
+    }
+
+    // ---- writes ----
+
+    /// สร้าง CA ถ้ายังไม่มี โดยเรียก dnsdevd เอง — พารามิเตอร์ของ cert
+    /// (SKI/AKI, อายุ 397 วัน, EKU) อยู่ที่เดียวใน Proxy.swift จะได้ไม่หลุดจากกัน
+    static func ensureCA() -> Bool {
+        if FileManager.default.fileExists(atPath: caPem) { return true }
+        guard let d = bundledDaemon ?? (FileManager.default.isExecutableFile(atPath: installedDaemon)
+                                        ? installedDaemon : nil) else { return false }
+        return Sys.run(d, ["--ensure-ca"]).code == 0
+    }
+
+    static var plistBody: String {
+        """
+        <?xml version="1.0" encoding="UTF-8"?>
+        <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+        <plist version="1.0">
+        <dict>
+        \t<key>Label</key><string>\(label)</string>
+        \t<key>ProgramArguments</key>
+        \t<array><string>\(installedDaemon)</string></array>
+        \t<key>RunAtLoad</key><true/>
+        \t<key>KeepAlive</key><true/>
+        \t<key>StandardOutPath</key><string>\(logFile)</string>
+        \t<key>StandardErrorPath</key><string>\(logFile)</string>
+        \t<key>ProcessType</key><string>Interactive</string>
+        </dict>
+        </plist>
+        """
+    }
+
+    /// ติดตั้งเป็น LaunchAgent — ไม่ต้องขอรหัสผ่านเลย ทุกอย่างอยู่ใน home ของ user
+    static func install() -> (ok: Bool, msg: String) {
+        guard let src = bundledDaemon else {
+            return (false, "หา dnsdevd ที่มากับแอปไม่เจอ — build ใหม่ด้วย app/build.sh")
+        }
+        let fm = FileManager.default
+        do {
+            try fm.createDirectory(atPath: (installedDaemon as NSString).deletingLastPathComponent,
+                                   withIntermediateDirectories: true)
+            try fm.createDirectory(atPath: stateDir, withIntermediateDirectories: true)
+            try fm.createDirectory(atPath: home + "/Library/LaunchAgents",
+                                   withIntermediateDirectories: true)
+            // คัดลอกจริง ไม่ทำ symlink — ถ้าแอปถูกลบหรือย้าย launchd ต้องยังหาไบนารีเจอ
+            if fm.fileExists(atPath: installedDaemon) { try fm.removeItem(atPath: installedDaemon) }
+            try fm.copyItem(atPath: src, toPath: installedDaemon)
+            try fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: installedDaemon)
+            try plistBody.write(toFile: agentPlist, atomically: true, encoding: .utf8)
+        } catch {
+            return (false, "ติดตั้งไม่สำเร็จ: \(error.localizedDescription)")
+        }
+        let uid = getuid()
+        _ = Sys.run("/bin/launchctl", ["bootout", "gui/\(uid)/\(label)"])
+        let r = Sys.run("/bin/launchctl", ["bootstrap", "gui/\(uid)", agentPlist])
+        guard r.code == 0 else {
+            return (false, "launchctl bootstrap ล้มเหลว: \(r.err.trimmingCharacters(in: .whitespacesAndNewlines))")
+        }
+        return (true, "")
+    }
+
+    static func uninstall() {
+        _ = Sys.run("/bin/launchctl", ["bootout", "gui/\(getuid())/\(label)"])
+        try? FileManager.default.removeItem(atPath: agentPlist)
+        try? FileManager.default.removeItem(atPath: installedDaemon)
+    }
+
+    static func restart() -> Bool {
+        Sys.run("/bin/launchctl", ["kickstart", "-k", "gui/\(getuid())/\(label)"]).code == 0
+    }
+
+    static var trustCmd: String {
+        "security add-trusted-cert -d -r trustRoot -p ssl -k /Library/Keychains/System.keychain \(caPem)"
+    }
+    static var untrustCmd: String { "security remove-trusted-cert -d \(caPem)" }
 }
 
 extension String {
@@ -349,6 +557,7 @@ final class Store: ObservableObject {
     @Published var syntaxMsg = ""
     @Published var confDir = true
     @Published var orphans: [String] = []
+    @Published var proxy = ProxyState()
     @Published var probes: [String: Probe] = [:]
     @Published var busy = false
     @Published var loginItem = LoginItem.isEnabled
@@ -362,7 +571,9 @@ final class Store: ObservableObject {
     var health: Health {
         if pid == nil || !syntaxOK || !confDir { return .err }
         if zones.contains(where: { $0.resolver == nil }) { return .err }
+        if proxy.installed && !proxy.running { return .err }
         if !orphans.isEmpty || zones.contains(where: { !$0.shadow.isEmpty }) { return .warn }
+        if proxy.running && proxy.terminates && !proxy.caTrusted { return .warn }
         return .ok
     }
 
@@ -383,6 +594,7 @@ final class Store: ObservableObject {
         syntaxMsg = s.syntaxMsg
         confDir = s.confDir
         orphans = s.orphans
+        proxy = s.proxy
     }
 
     /// โพลเบา ๆ ทุก 15 วิ ให้ไอคอนตามสถานะจริงแม้ไม่ได้เปิด popover
@@ -449,6 +661,29 @@ final class Store: ObservableObject {
                 text: "/etc/resolver/\(o) ไม่มี zone รองรับ — query จะ forward ออก internet เปล่า ๆ",
                 fixLabel: "ลบ",
                 fix: { [weak self] in Task { await self?.removeResolver(o) } }))
+        }
+
+        if proxy.installed, !proxy.running {
+            let why = proxy.portHolder.map { " — :\(proxy.https) ถูก \($0) ยึดอยู่" } ?? ""
+            out.append(.init(level: .err, text: "dnsdevd ไม่ได้รัน\(why)",
+                             fixLabel: proxy.portHolder == nil ? "เริ่ม" : "ดู log",
+                             fix: proxy.portHolder == nil
+                                ? { [weak self] in Task { await self?.restartProxy() } }
+                                : { NSWorkspace.shared.open(URL(fileURLWithPath: Prox.logFile)) }))
+        }
+
+        if !proxy.installed, !proxy.routes.isEmpty {
+            out.append(.init(level: .warn,
+                             text: "มี route ของ proxy อยู่ \(proxy.routes.count) อัน แต่ยังไม่ได้ติดตั้ง dnsdevd",
+                             fixLabel: "ติดตั้ง",
+                             fix: { [weak self] in Task { await self?.installProxy() } }))
+        }
+
+        if proxy.running, proxy.terminates, !proxy.caTrusted {
+            out.append(.init(level: .warn,
+                             text: "cert ของ dnsdev ยังไม่ถูกติดตั้งในเครื่อง — browser จะเตือนทุกครั้งที่เปิด https",
+                             fixLabel: "ติดตั้ง cert",
+                             fix: { [weak self] in Task { await self?.trustCA() } }))
         }
         return out
     }
@@ -549,6 +784,87 @@ final class Store: ObservableObject {
             await withAdmin(["printf '%s\\n' \(Sys.esc(line)) >> \(Sys.confFile)"] + Sys.reloadCmds,
                             prompt: "dnsdev — เพิ่ม conf-dir=", success: "เพิ่ม conf-dir= แล้ว")
         }
+    }
+
+    // MARK: ชั้น https
+
+    /// ติดตั้ง proxy ไม่ต้องขอรหัสผ่าน — LaunchAgent กับไบนารีอยู่ใน home ทั้งคู่
+    func installProxy() async {
+        busy = true
+        let r = await Task.detached(priority: .userInitiated) { () -> (ok: Bool, msg: String) in
+            _ = Prox.ensureCA()
+            return Prox.install()
+        }.value
+        busy = false
+        await refresh()
+        if r.ok {
+            say(proxy.caTrusted ? "ติดตั้ง proxy แล้ว" : "ติดตั้ง proxy แล้ว — เหลือติดตั้ง cert อีกขั้น")
+        } else {
+            say(r.msg, bad: true)
+        }
+    }
+
+    func uninstallProxy() async {
+        busy = true
+        await Task.detached(priority: .userInitiated) { Prox.uninstall() }.value
+        busy = false
+        await refresh()
+        say("ถอด proxy แล้ว — CA กับ route ยังอยู่")
+    }
+
+    func restartProxy() async {
+        busy = true
+        let ok = await Task.detached(priority: .userInitiated) { Prox.restart() }.value
+        busy = false
+        await refresh()
+        say(ok ? "restart proxy แล้ว" : "restart ไม่สำเร็จ — ติดตั้งหรือยัง?", bad: !ok)
+    }
+
+    /// ขั้นเดียวในชั้นนี้ที่ต้องใช้ root — เอา CA เข้า System keychain
+    func trustCA() async {
+        let made = await Task.detached(priority: .userInitiated) { Prox.ensureCA() }.value
+        guard made else { return say("สร้าง CA ไม่สำเร็จ — build dnsdevd หรือยัง?", bad: true) }
+        await withAdmin([Prox.trustCmd],
+                        prompt: "dnsdev — ติดตั้ง cert ของ dnsdev เข้าเครื่อง",
+                        success: "ติดตั้ง cert แล้ว — https ในเครื่องจะไม่ขึ้นเตือนอีก")
+    }
+
+    func untrustCA() async {
+        await withAdmin([Prox.untrustCmd],
+                        prompt: "dnsdev — เอา cert ของ dnsdev ออกจากเครื่อง",
+                        success: "เอา cert ออกแล้ว")
+    }
+
+    // MARK: route
+
+    func setRoute(_ domain: String, port rawPort: String, passthrough: Bool = false) async {
+        let p = rawPort.trimmingCharacters(in: .whitespaces)
+            .trimmingCharacters(in: CharacterSet(charactersIn: ":"))
+        guard let n = Int(p), (1...65535).contains(n) else {
+            return say("พอร์ตไม่ถูกต้อง: \(rawPort)", bad: true)
+        }
+        var routes = proxy.routes.filter { $0.host != domain }
+        routes.append(ProxyRoute(host: domain, to: "127.0.0.1:\(n)", passthrough: passthrough))
+        await writeRoutes(routes, note: "https://\(domain) → :\(n)")
+    }
+
+    func removeRoute(_ domain: String) async {
+        guard proxy.route(for: domain) != nil else { return }
+        await writeRoutes(proxy.routes.filter { $0.host != domain },
+                          note: "เอา \(domain) ออกจาก proxy แล้ว")
+    }
+
+    private func writeRoutes(_ routes: [ProxyRoute], note: String) async {
+        let https = proxy.https, http = proxy.http
+        do {
+            try await Task.detached(priority: .userInitiated) {
+                try Prox.writeRoutes(https: https, http: http, routes)
+            }.value
+        } catch {
+            return say("เขียน routes.json ไม่ได้: \(error.localizedDescription)", bad: true)
+        }
+        await refresh()
+        say(note)
     }
 
     // MARK: zone
@@ -780,6 +1096,7 @@ struct ZoneRow: View {
     @State private var editing = false
     @State private var eDomain = ""
     @State private var eTarget = ""
+    @State private var ePort = ""
     @State private var eKind: ZoneKind = .address
 
     var body: some View {
@@ -803,6 +1120,18 @@ struct ZoneRow: View {
             }
             Spacer(minLength: 6)
             if zone.kind == .server { Pill(text: "server", tint: .blue) }
+            if let r = store.proxy.route(for: zone.domain) {
+                Button {
+                    if let u = URL(string: "https://\(zone.domain)") { NSWorkspace.shared.open(u) }
+                } label: {
+                    Pill(text: r.passthrough ? "https \(r.shortTo) ⇢" : "https \(r.shortTo)",
+                         tint: store.proxy.caTrusted && store.proxy.running ? .green : .orange)
+                }
+                .buttonStyle(.plain)
+                .help(store.proxy.running
+                      ? "เปิด https://\(zone.domain)"
+                      : "dnsdevd ไม่ได้รัน — route นี้ยังไม่มีผล")
+            }
             if let r = zone.resolver {
                 Pill(text: "/etc/resolver/\(r)", tint: .green)
             } else {
@@ -815,7 +1144,7 @@ struct ZoneRow: View {
                 Button("แก้ไข") { beginEdit() }
                     .buttonStyle(.borderless).font(.system(size: 11))
                 Button {
-                    Task { await store.remove(zone) }
+                    Task { await store.remove(zone); await store.removeRoute(zone.domain) }
                 } label: { Image(systemName: "trash").font(.system(size: 11)) }
                     .buttonStyle(.borderless).foregroundStyle(.red)
             }
@@ -830,7 +1159,14 @@ struct ZoneRow: View {
                 TextField(eKind == .server ? "10.0.0.1#5353" : "127.0.0.1", text: $eTarget)
                     .textFieldStyle(.roundedBorder)
                     .font(.system(size: 11, design: .monospaced))
-                    .frame(width: 108)
+                    .frame(width: 96)
+                if eKind == .address {
+                    TextField(":3000", text: $ePort)
+                        .textFieldStyle(.roundedBorder)
+                        .font(.system(size: 11, design: .monospaced))
+                        .frame(width: 54)
+                        .help("พอร์ตของ dev server — ลบให้ว่างเพื่อเอาออกจาก proxy")
+                }
             }
             HStack(spacing: 8) {
                 KindPicker(kind: $eKind)
@@ -839,9 +1175,18 @@ struct ZoneRow: View {
                     .buttonStyle(.borderless).font(.system(size: 11))
                 Button("บันทึก") {
                     let z = zone
-                    let d = eDomain, t = eTarget, k = eKind
+                    let d = eDomain.trimmingCharacters(in: .whitespaces)
+                        .trimmingCharacters(in: CharacterSet(charactersIn: ".")).lowercased()
+                    let t = eTarget, k = eKind, pt = ePort.trimmingCharacters(in: .whitespaces)
                     editing = false
-                    Task { await store.update(z, domain: d, target: t, kind: k) }
+                    Task {
+                        await store.update(z, domain: d, target: t, kind: k)
+                        guard store.flash?.bad != true else { return }
+                        // โดเมนอาจเปลี่ยนชื่อ route เก่าจึงต้องถูกเก็บกวาดเสมอ
+                        if d != z.domain { await store.removeRoute(z.domain) }
+                        if k == .address, !pt.isEmpty { await store.setRoute(d, port: pt) }
+                        else { await store.removeRoute(d) }
+                    }
                 }
                 .font(.system(size: 11))
                 .disabled(store.busy)
@@ -853,6 +1198,7 @@ struct ZoneRow: View {
     private func beginEdit() {
         eDomain = zone.domain
         eTarget = zone.target
+        ePort = store.proxy.route(for: zone.domain)?.port ?? ""
         eKind = zone.kind
         editing = true
     }
@@ -890,6 +1236,7 @@ struct ContentView: View {
     @EnvironmentObject var store: Store
     @State private var domain = ""
     @State private var target = ""
+    @State private var port = ""
     @State private var kind: ZoneKind = .address
     @State private var listHeight: CGFloat = 0
 
@@ -917,8 +1264,11 @@ struct ContentView: View {
     private var header: some View {
         HStack(spacing: 6) {
             Text("dnsdev").font(.system(size: 14, weight: .bold))
-            Pill(text: store.pid.map { "dnsmasq · pid \($0)" } ?? "ไม่ได้รัน",
+            Pill(text: store.pid.map { "dnsmasq · \($0)" } ?? "dnsmasq หยุด",
                  tint: store.pid != nil ? .green : .red)
+            if store.proxy.installed || !store.proxy.routes.isEmpty {
+                Pill(text: proxyPillText, tint: proxyPillTint)
+            }
             Spacer()
             if store.busy { ProgressView().controlSize(.small).scaleEffect(0.7).frame(width: 16) }
             Menu {
@@ -927,6 +1277,28 @@ struct ContentView: View {
                 } else {
                     Button("restart dnsmasq") { Task { await store.restart() } }
                     Button("หยุด dnsmasq") { Task { await store.stopService() } }
+                }
+                Divider()
+                if store.proxy.installed {
+                    Button(store.proxy.running ? "restart proxy (https)" : "เริ่ม proxy (https)") {
+                        Task { await store.restartProxy() }
+                    }
+                    Button("ถอด proxy ออก") { Task { await store.uninstallProxy() } }
+                } else {
+                    Button("ติดตั้ง proxy (https)") { Task { await store.installProxy() } }
+                }
+                if store.proxy.caTrusted {
+                    Button("เอา cert ของ dnsdev ออกจากเครื่อง") { Task { await store.untrustCA() } }
+                } else {
+                    Button("ติดตั้ง cert เข้าเครื่อง…") { Task { await store.trustCA() } }
+                }
+                Button("เปิดโฟลเดอร์ cert") {
+                    NSWorkspace.shared.open(URL(fileURLWithPath: Prox.caDir))
+                }
+                if FileManager.default.fileExists(atPath: Prox.logFile) {
+                    Button("เปิด log ของ proxy") {
+                        NSWorkspace.shared.open(URL(fileURLWithPath: Prox.logFile))
+                    }
                 }
                 Divider()
                 Toggle("เปิด dnsdev เองตอน login", isOn: Binding(
@@ -945,6 +1317,17 @@ struct ContentView: View {
         .padding(.horizontal, 12).padding(.top, 11).padding(.bottom, 9)
     }
 
+    /// pill ของชั้น https บอกสามสถานะที่ต่างกันจริง ๆ: ไม่รัน / รันแต่ยังไม่มี cert / พร้อมใช้
+    private var proxyPillText: String {
+        if !store.proxy.installed { return "https ยังไม่ติดตั้ง" }
+        if !store.proxy.running { return "https หยุด" }
+        return store.proxy.caTrusted ? "https :\(store.proxy.https)" : "https · ยังไม่มี cert"
+    }
+    private var proxyPillTint: Color {
+        if !store.proxy.installed || !store.proxy.running { return .red }
+        return store.proxy.caTrusted ? .green : .orange
+    }
+
     private var adder: some View {
         VStack(alignment: .leading, spacing: 7) {
             HStack(spacing: 6) {
@@ -953,14 +1336,23 @@ struct ContentView: View {
                 TextField(kind == .server ? "10.0.0.1#5353" : "127.0.0.1", text: $target)
                     .textFieldStyle(.roundedBorder)
                     .font(.system(size: 11, design: .monospaced))
-                    .frame(width: 108)
+                    .frame(width: 96)
+                if kind == .address {
+                    TextField(":3000", text: $port)
+                        .textFieldStyle(.roundedBorder)
+                        .font(.system(size: 11, design: .monospaced))
+                        .frame(width: 54)
+                        .help("ใส่พอร์ตของ dev server แล้วเปิด https://โดเมน ได้เลยโดยไม่ต้องพิมพ์พอร์ต")
+                }
                 Button("เพิ่ม") { submit() }
                     .keyboardShortcut(.return, modifiers: [])
                     .disabled(domain.trimmingCharacters(in: .whitespaces).isEmpty || store.busy)
             }
             HStack(spacing: 8) {
                 KindPicker(kind: $kind)
-                Text(kind.hint)
+                Text(kind == .address && !port.isEmpty
+                     ? "https://\(domain.isEmpty ? "โดเมน" : domain) → 127.0.0.1:\(port.trimmingCharacters(in: CharacterSet(charactersIn: ":")))"
+                     : kind.hint)
                     .font(.system(size: 10.5)).foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
             }
@@ -1004,10 +1396,17 @@ struct ContentView: View {
     }
 
     private func submit() {
-        let d = domain, t = target, k = kind
+        let d = domain.trimmingCharacters(in: .whitespaces)
+            .trimmingCharacters(in: CharacterSet(charactersIn: ".")).lowercased()
+        let t = target, k = kind, pt = port
         Task {
             await store.add(domain: d, target: t, kind: k)
-            if store.flash?.bad != true { domain = ""; target = "" }
+            guard store.flash?.bad != true else { return }
+            // zone เข้าแล้วค่อยผูก route — ถ้า zone ล้มก็ไม่ควรมี route ค้าง
+            if k == .address, !pt.trimmingCharacters(in: .whitespaces).isEmpty {
+                await store.setRoute(d, port: pt)
+            }
+            domain = ""; target = ""; port = ""
         }
     }
 }
@@ -1018,7 +1417,36 @@ struct ContentView: View {
 enum Main {
     static func main() {
         if CommandLine.arguments.contains("--doctor") { doctor(); exit(0) }
+        // --popover เปิด popover ให้เองตอนขึ้น ใช้ถ่ายรูป/ดีบักหน้าตาโดยไม่ต้องขอ
+        // assistive access (กด NSStatusBarButton ของตัวเองไม่นับเป็นการควบคุมแอปอื่น)
+        if CommandLine.arguments.contains("--popover") {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) { clickStatusItem() }
+        }
         DNSDevApp.main()
+    }
+
+    static func clickStatusItem() {
+        func find(_ v: NSView?) -> NSStatusBarButton? {
+            guard let v else { return nil }
+            if let b = v as? NSStatusBarButton { return b }
+            for s in v.subviews { if let b = find(s) { return b } }
+            return nil
+        }
+        var clicked = false
+        for w in NSApp.windows where !clicked {
+            if let b = find(w.contentView) { b.performClick(nil); clicked = true }
+        }
+        guard clicked else {
+            FileHandle.standardError.write(Data("หา NSStatusBarButton ไม่เจอ\n".utf8)); return
+        }
+        // popover ขึ้นเป็นหน้าต่างใหม่ รอให้ layout เสร็จก่อนค่อยวัด
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) {
+            var out = "หน้าต่างหลังกด:\n"
+            for w in NSApp.windows where w.isVisible {
+                out += "  \(type(of: w))  \(Int(w.frame.width))x\(Int(w.frame.height))\n"
+            }
+            FileHandle.standardError.write(Data(out.utf8))
+        }
     }
 
     static func doctor() {
@@ -1028,6 +1456,19 @@ enum Main {
         print("syntax       \(s.syntaxOK ? "OK" : "ผิด: \(s.syntaxMsg)")")
         print("conf-dir     \(s.confDir ? "มี" : "ไม่มี")")
         print("orphans      \(s.orphans.isEmpty ? "—" : s.orphans.joined(separator: ", "))")
+        let px = s.proxy
+        print("proxy        " + (px.installed
+            ? (px.running ? "pid \(px.pid!)" : "ติดตั้งแล้วแต่ไม่ได้รัน")
+            : "ยังไม่ติดตั้ง")
+            + "  · https :\(px.https) http :\(px.http)"
+            + (px.portHolder.map { "  · :\(px.https) ถูก \($0) ยึด" } ?? ""))
+        print("cert         " + (px.caExists
+            ? (px.caTrusted ? "ติดตั้งในเครื่องแล้ว" : "มี CA แต่ยังไม่ได้ติดตั้งเข้าเครื่อง")
+            : "ยังไม่มี CA"))
+        print("routes       \(px.routes.count)")
+        for r in px.routes {
+            print("  https://\(r.host) → \(r.to)" + (r.passthrough ? "  [passthrough]" : ""))
+        }
         print("zones        \(s.zones.count)")
         for z in s.zones {
             print("  \(z.kind.directive)=/\(z.domain)/\(z.target)"
