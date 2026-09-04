@@ -384,6 +384,7 @@ cmd_proxy() {
     stop)     launchctl bootout "gui/$UID/$AGENT_LABEL" 2>/dev/null && ok "หยุดแล้ว" \
                 || warn "ไม่ได้รันอยู่";;
     log)      [ -f "$PROXY_LOG" ] && tail -n "${2:-40}" "$PROXY_LOG" || info "ยังไม่มี log";;
+    edit)     proxy_edit;;
     status)   proxy_status;;
     *)        err "ไม่รู้จัก: dnsdev proxy $1"; return 1;;
   esac
@@ -462,6 +463,34 @@ proxy_status() {
   ca_trusted && ok "CA เชื่อถือแล้ว (System keychain)" || warn "CA ยังไม่ถูกเชื่อถือ — 'dnsdev trust'"
 }
 
+proxy_edit() {
+  mkdir -p "$STATE"
+  # สร้างไฟล์ตั้งต้นให้ก่อน จะได้ไม่เปิดเจอไฟล์เปล่าแล้วต้องนึกโครงสร้างเอง
+  [ -f "$ROUTES" ] || cat > "$ROUTES" <<'JSON'
+{
+  "https": 443,
+  "http": 80,
+  "routes": [
+    { "host": "myapp.test", "to": "127.0.0.1:3000" }
+  ]
+}
+JSON
+  local ed="${VISUAL:-${EDITOR:-}}"
+  if [ -n "$ed" ]; then $ed "$ROUTES"; else open -t "$ROUTES"; return 0; fi
+
+  # editor ในเทอร์มินัลบล็อกจนปิด ตรวจให้เลยว่าไฟล์ยังใช้ได้ไหม
+  # daemon จะเก็บ config เดิมไว้ถ้า JSON พัง แปลว่าที่แก้ไปจะเงียบ ๆ ไม่มีผล
+  if F="$ROUTES" py -c 'import json,os; json.load(open(os.environ["F"]))' 2>/dev/null; then
+    ok "JSON ใช้ได้"
+    sleep 1
+    proxy_running && info "$(tail -1 "$PROXY_LOG" 2>/dev/null)"
+  else
+    err "JSON พัง — daemon จะใช้ค่าเดิมต่อไป ที่แก้ไปยังไม่มีผล"
+    F="$ROUTES" py -c 'import json,os; json.load(open(os.environ["F"]))' 2>&1 | tail -1
+    return 1
+  fi
+}
+
 ca_trusted() {
   [ -f "$CA_PEM" ] || return 1
   # เทียบด้วย fingerprint — ชื่อ CA ซ้ำกันได้ แต่ลายนิ้วมือไม่ซ้ำ
@@ -511,6 +540,7 @@ ${B}dnsdev${N} — จัดการ local dev DNS ให้จบในคำ�
 ${B}ชั้น https${N} (ไม่ต้องพิมพ์พอร์ต)
   ${B}dnsdev proxy install${N}       ติดตั้ง dnsdevd เป็น LaunchAgent แล้วเริ่มรัน
   ${B}dnsdev proxy status${N}        ดูว่ารันอยู่ไหม ฟังพอร์ตอะไร CA เชื่อถือหรือยัง
+  ${B}dnsdev proxy edit${N}          แก้ routes.json ($EDITOR ไม่ตั้งก็เปิดตัวแก้ข้อความ)
   ${B}dnsdev proxy log${N} [n]       ดู log ของ proxy
   ${B}dnsdev proxy stop|start${N}    หยุด / เริ่มใหม่
   ${B}dnsdev proxy uninstall${N}     ถอด LaunchAgent ออก

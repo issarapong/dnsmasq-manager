@@ -61,11 +61,16 @@ struct Config: Codable {
 
     static let empty = Config(https: 443, http: 80, routes: [])
 
-    static func load() -> Config {
-        guard let d = try? Data(contentsOf: routesFile) else { return .empty }
-        guard let c = try? JSONDecoder().decode(Config.self, from: d) else {
-            log("routes.json พัง — ใช้ค่าว่างไปก่อน")
+    /// คืน nil เมื่ออ่านไม่ได้ ให้คนเรียกเก็บ config เดิมไว้
+    /// ถ้าคืนค่าว่างแทน การพิมพ์ผิดหนึ่งตัวจะล้ม route ทั้งหมดทันทีระหว่างกำลังแก้ไฟล์อยู่
+    static func load() -> Config? {
+        guard let d = try? Data(contentsOf: routesFile) else {
+            log("ไม่มี \(routesFile.path) — ยังไม่มี route")
             return .empty
+        }
+        guard let c = try? JSONDecoder().decode(Config.self, from: d) else {
+            log("routes.json อ่านไม่ออก (JSON ผิด?) — ใช้ค่าเดิมต่อไปก่อน")
+            return nil
         }
         return c
     }
@@ -294,7 +299,8 @@ final class Proxy {
 
     // MARK: reload
     private func reload() {
-        let new = Config.load()
+        // อ่านไม่ออก = ไม่แตะอะไรเลย ปล่อยให้ของเดิมวิ่งต่อจนกว่าไฟล์จะถูกแก้ให้ถูก
+        guard let new = Config.load() else { watchFile(); return }
         config = new
         portListeners.forEach { $0.cancel() }
         portListeners = []

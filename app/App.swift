@@ -466,6 +466,16 @@ enum Prox {
         Sys.run("/bin/launchctl", ["kickstart", "-k", "gui/\(getuid())/\(label)"]).code == 0
     }
 
+    /// เปิดด้วย `open -t` ไม่ใช่ NSWorkspace — .json อาจถูกผูกไว้กับ Xcode หรือแอปอื่น
+    /// ที่ไม่ได้ตั้งใจ `-t` บังคับให้ใช้ตัวแก้ข้อความเริ่มต้นของระบบเสมอ
+    static func openRoutesFile() {
+        if !FileManager.default.fileExists(atPath: routesFile) {
+            let (https, http, routes) = readRoutes()      // ยังไม่มีไฟล์ = ได้ค่าเริ่มต้น
+            try? writeRoutes(https: https, http: http, routes)
+        }
+        _ = Sys.run("/usr/bin/open", ["-t", routesFile])
+    }
+
     static var trustCmd: String {
         "security add-trusted-cert -d -r trustRoot -p ssl -k /Library/Keychains/System.keychain \(caPem)"
     }
@@ -1291,6 +1301,10 @@ struct ContentView: View {
                     Button("เอา cert ของ dnsdev ออกจากเครื่อง") { Task { await store.untrustCA() } }
                 } else {
                     Button("ติดตั้ง cert เข้าเครื่อง…") { Task { await store.trustCA() } }
+                }
+                Button("แก้ไฟล์ routes.json") { Prox.openRoutesFile() }
+                Button("เปิดโฟลเดอร์ dnsdev") {
+                    NSWorkspace.shared.open(URL(fileURLWithPath: Prox.stateDir))
                 }
                 Button("เปิดโฟลเดอร์ cert") {
                     NSWorkspace.shared.open(URL(fileURLWithPath: Prox.caDir))
