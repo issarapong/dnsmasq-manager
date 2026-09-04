@@ -16,13 +16,34 @@
 xattr -dr com.apple.quarantine ~/Applications/dnsdev.app
 ```
 
+## สองชั้น
+
+**ชั้น DNS** (dnsmasq + `/etc/resolver`) ตอบว่าโดเมนนี้คือเครื่องไหน — แต่ยังต้อง
+พิมพ์ `:3000` อยู่ดี **ชั้น https** (`dnsdevd`) ฟัง `:443` แล้วส่งต่อตามชื่อ
+พร้อมออก cert ให้เอง จึงเปิด `https://myapp.test` ได้ตรง ๆ
+
+```
+dnsdev add myapp.test 3000     # DNS + route → https://myapp.test
+dnsdev proxy install           # ติดตั้ง dnsdevd เป็น LaunchAgent
+dnsdev trust                   # เอา CA เข้า System keychain (ครั้งเดียว)
+```
+
+route มีสองโหมด — **terminate** (ค่าเริ่มต้น) dnsdevd ถือ cert ให้ กับ
+**passthrough** (`--pass`) ที่อ่านแค่ SNI แล้วส่ง TLS ดิบต่อ ใช้กับ VM หรือ
+คอนเทนเนอร์ที่มี cert ของตัวเองอยู่แล้ว เช่น nginx ใน Lima — ถ้า terminate
+ทับ cert เดิมจะหายไปหมด
+
 ## สามหน้าเหมือนกัน เลือกใช้ตามสะดวก
 
 | | ที่อยู่ | รัน |
 |---|---|---|
 | menu bar app | `app/App.swift` | `app/build.sh` → `~/Applications/dnsdev.app` |
-| CLI | `cli/dnsdev` | `dnsdev add myapp.test` |
+| CLI | `cli/dnsdev` | `dnsdev add myapp.test 3000` |
 | web UI | `web/dnsdev-ui` | `dnsdev-ui` แล้วเปิด browser ให้เอง |
+| proxy | `proxy/Proxy.swift` | รันเป็น LaunchAgent ไม่มีหน้าจอ |
+
+ทั้งสามหน้าจัดการ route กับติดตั้ง cert ได้ครบเท่ากัน — แอปอยู่ในเมนู `⋯`
+เว็บอยู่ในการ์ด "ชั้น https" CLI ใช้ `dnsdev proxy` / `dnsdev trust`
 
 `~/.local/bin/dnsdev` และ `~/.local/bin/dnsdev-ui` เป็น symlink มาที่รีโปนี้
 แก้ไฟล์ที่นี่มีผลทันที — แต่ถ้า `/Volumes/Server` ไม่ได้ mount คำสั่งจะหาย
@@ -52,6 +73,19 @@ app/build.sh          # universal binary + bundle + ad-hoc sign + ติดต�
   `NSApp.windows` ดูขนาดหน้าต่างจริง
 - **TLD** — `.test` สงวนตาม RFC 6761 ใช้ตัวนี้ `.local` ใช้ไม่ได้เด็ดขาด (macOS ส่งไป
   mDNSResponder เสมอ) `.dev` อยู่ใน HSTS preload ต้องมี cert
+- **cert ต้องมี SKI/AKI** — ไม่มีแล้ว Safari ผ่านสบายแต่ OpenSSL 3 (Node, Python,
+  curl ที่ลิงก์กับมัน) ปฏิเสธด้วย `Missing Authority Key Identifier` และอายุ leaf
+  ต้องไม่เกิน 398 วัน ไม่งั้น Apple ไม่รับ
+- **wildcard ของ TLS ครอบชั้นเดียว** — `*.myapp.test` ไม่ครอบ `a.b.myapp.test` และ
+  `*.*.x` ใช้ไม่ได้ตามสเปค ขณะที่ DNS ฝั่ง dnsmasq ครอบทุกชั้น `dnsdevd` จึงออก cert
+  ตาม SNI ที่เห็นจริงแล้ว cache ไว้ ไม่งั้นสัญญา "ทุกชั้น" จะพังที่ชั้น https
+- **พอร์ตต่ำกว่า 1024** — macOS ไม่หวงเหมือน Linux ผูก `:443` ด้วยสิทธิ์ user ได้เลย
+  `dnsdevd` จึงเป็น LaunchAgent ไม่ต้องเป็น root daemon งานที่ต้องขอรหัสเหลือแค่
+  เอา CA เข้า System keychain
+- **คิวของ listener** — `NWListener` รายงานสถานะกลับมาทางคิวที่ให้ไว้ ถ้า `reload()`
+  รันบนคิวเดียวกันแล้วรอ semaphore มันจะรอตัวเองจนหมดเวลาแล้ว proxy ดับทั้งตัว
+  (ดู `lq` ใน `Proxy.swift`)
+- **ดีบักหน้าตาแอป** — `dnsdev --popover` เปิด popover ให้เองตอนขึ้น
 
 ## ค้างอยู่
 

@@ -8,7 +8,7 @@
 แล้วขอผ่าน dialog ของ macOS — กรอกรหัสครั้งเดียวต่อหนึ่งการกระทำ
 เซิร์ฟเวอร์เองรันด้วยสิทธิ์ผู้ใช้ปกติ ไม่ได้รันเป็น root
 """
-import http.server, json, os, re, secrets, shutil, socket, subprocess, sys, threading, webbrowser
+import http.server, json, os, re, secrets, shutil, socket, subprocess, sys, tempfile, threading, time, webbrowser
 from pathlib import Path
 
 RESOLVER = Path("/etc/resolver")
@@ -171,6 +171,7 @@ def snapshot() -> dict:
                     if CONF.is_file() else False,
         "zones": [dict(z, shadow=hosts_shadow(z["domain"])) for z in zones],
         "orphans": orphan_resolvers(),
+        "proxy": proxy_state(),
     }
 
 
@@ -241,6 +242,208 @@ def act_restart() -> dict:
     return {"ok": good, "msg": "restart + flush cache แล้ว" if good else out}
 
 
+# ---------- ชั้น https (dnsdevd) ----------
+# ชั้นนี้แทบไม่ต้องใช้ root: LaunchAgent เป็นของ user และ macOS ยอมให้ผูก
+# พอร์ตต่ำกว่า 1024 โดยไม่ต้องเป็น root  เหลืองานเดียวที่ขอรหัส คือเอา CA
+# เข้า System keychain
+STATE = Path.home() / ".config/dnsdev"
+ROUTES = STATE / "routes.json"
+CA_PEM = STATE / "ca/ca.pem"
+PROXY_LOG = STATE / "proxy.log"
+AGENT_LABEL = "local.dnsdev.proxy"
+AGENT_PLIST = Path.home() / f"Library/LaunchAgents/{AGENT_LABEL}.plist"
+DAEMON = Path.home() / ".local/libexec/dnsdevd"
+
+
+def find_daemon() -> Path | None:
+    """ตัวที่ติดตั้งแล้วมาก่อน แล้วค่อยไล่หาในรีโป (ตอน dev)"""
+    here = Path(__file__).resolve().parent
+    for c in (DAEMON, here.parent / "proxy/dnsdevd", here / "proxy/dnsdevd"):
+        if c.is_file() and os.access(c, os.X_OK):
+            return c
+    return None
+
+
+def read_routes() -> tuple[int, int, list[dict]]:
+    try:
+        cfg = json.loads(ROUTES.read_text())
+    except Exception:
+        return 443, 80, []
+    rs = []
+    for r in cfg.get("routes") or []:
+        if isinstance(r, dict) and r.get("host") and r.get("to"):
+            rs.append({"host": r["host"], "to": r["to"],
+                       "passthrough": r.get("mode") == "passthrough"})
+    return int(cfg.get("https", 443)), int(cfg.get("http", 80)), sorted(rs, key=lambda r: r["host"])
+
+
+def write_routes(https: int, http: int, routes: list[dict]) -> None:
+    STATE.mkdir(parents=True, exist_ok=True)
+    body = {"https": https, "http": http, "routes": []}
+    for r in sorted(routes, key=lambda r: r["host"]):
+        e = {"host": r["host"], "to": r["to"]}
+        if r.get("passthrough"):
+            e["mode"] = "passthrough"
+        body["routes"].append(e)
+    # เขียนไฟล์ชั่วคราวในโฟลเดอร์เดียวกันแล้ว rename ทับ — dnsdevd เฝ้าโฟลเดอร์อยู่
+    # จะเห็นการเปลี่ยนครั้งเดียวจบ ไม่ใช่เห็นไฟล์ครึ่ง ๆ กลาง ๆ
+    fd, tmp = tempfile.mkstemp(dir=str(STATE))
+    with os.fdopen(fd, "w") as fh:
+        json.dump(body, fh, indent=2, ensure_ascii=False)
+        fh.write("\n")
+    os.replace(tmp, ROUTES)
+
+
+def proxy_pid() -> int | None:
+    p = subprocess.run(["pgrep", "-f", str(DAEMON)], capture_output=True, text=True)
+    out = p.stdout.split()
+    return int(out[0]) if out else None
+
+
+def ca_trusted() -> bool:
+    """เทียบด้วย fingerprint — ชื่อ CA ซ้ำกันได้ ลายนิ้วมือไม่ซ้ำ"""
+    if not CA_PEM.is_file():
+        return False
+    p = subprocess.run(["/usr/bin/openssl", "x509", "-in", str(CA_PEM),
+                        "-noout", "-fingerprint", "-sha1"], capture_output=True, text=True)
+    if p.returncode != 0 or "=" not in p.stdout:
+        return False
+    fp = p.stdout.split("=", 1)[1].strip().replace(":", "")
+    q = subprocess.run(["/usr/bin/security", "find-certificate", "-a", "-Z",
+                        "/Library/Keychains/System.keychain"], capture_output=True, text=True)
+    return f"SHA-1 hash: {fp}" in q.stdout
+
+
+def port_holder(port: int, ours: int | None) -> str | None:
+    p = subprocess.run(["/usr/sbin/lsof", "-nP", f"-iTCP:{port}", "-sTCP:LISTEN"],
+                       capture_output=True, text=True)
+    for line in p.stdout.splitlines()[1:]:
+        f = line.split()
+        if len(f) < 2 or not f[1].isdigit():
+            continue
+        if ours and int(f[1]) == ours:
+            return None
+        return f"{f[0]} (pid {f[1]})"
+    return None
+
+
+def proxy_state() -> dict:
+    https, http, routes = read_routes()
+    pid = proxy_pid()
+    return {
+        "installed": AGENT_PLIST.is_file(),
+        "pid": pid,
+        "https": https, "http": http,
+        "routes": routes,
+        "ca_exists": CA_PEM.is_file(),
+        "ca_trusted": ca_trusted(),
+        "port_holder": port_holder(https, pid),
+        "has_daemon": find_daemon() is not None,
+    }
+
+
+def ensure_ca() -> bool:
+    if CA_PEM.is_file():
+        return True
+    d = find_daemon()
+    return bool(d) and subprocess.run([str(d), "--ensure-ca"], capture_output=True).returncode == 0
+
+
+PLIST_BODY = """<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+\t<key>Label</key><string>{label}</string>
+\t<key>ProgramArguments</key>
+\t<array><string>{daemon}</string></array>
+\t<key>RunAtLoad</key><true/>
+\t<key>KeepAlive</key><true/>
+\t<key>StandardOutPath</key><string>{log}</string>
+\t<key>StandardErrorPath</key><string>{log}</string>
+\t<key>ProcessType</key><string>Interactive</string>
+</dict>
+</plist>
+"""
+
+
+def act_proxy_install() -> dict:
+    src = find_daemon()
+    if not src:
+        return {"ok": False, "msg": "หา dnsdevd ไม่เจอ — build ก่อนด้วย app/build.sh"}
+    st = proxy_state()
+    if st["port_holder"]:
+        return {"ok": False,
+                "msg": f":{st['https']} ถูก {st['port_holder']} ยึดอยู่ — "
+                       f"ย้ายตัวนั้น หรือเปลี่ยนพอร์ตใน routes.json"}
+    ensure_ca()
+    DAEMON.parent.mkdir(parents=True, exist_ok=True)
+    STATE.mkdir(parents=True, exist_ok=True)
+    AGENT_PLIST.parent.mkdir(parents=True, exist_ok=True)
+    # คัดลอกจริง ไม่ทำ symlink — ถ้ารีโปอยู่บนวอลุมที่ไม่ได้ mount launchd จะหาไม่เจอ
+    shutil.copyfile(src, DAEMON)
+    DAEMON.chmod(0o755)
+    AGENT_PLIST.write_text(PLIST_BODY.format(label=AGENT_LABEL, daemon=DAEMON, log=PROXY_LOG))
+    uid = os.getuid()
+    subprocess.run(["launchctl", "bootout", f"gui/{uid}/{AGENT_LABEL}"], capture_output=True)
+    p = subprocess.run(["launchctl", "bootstrap", f"gui/{uid}", str(AGENT_PLIST)],
+                       capture_output=True, text=True)
+    if p.returncode != 0:
+        return {"ok": False, "msg": f"launchctl bootstrap ล้มเหลว: {p.stderr.strip()}"}
+    time.sleep(1)
+    return {"ok": True, "msg": "ติดตั้ง proxy แล้ว"
+            + ("" if ca_trusted() else " — เหลือติดตั้ง cert อีกขั้น")}
+
+
+def act_proxy_uninstall() -> dict:
+    subprocess.run(["launchctl", "bootout", f"gui/{os.getuid()}/{AGENT_LABEL}"], capture_output=True)
+    AGENT_PLIST.unlink(missing_ok=True)
+    DAEMON.unlink(missing_ok=True)
+    return {"ok": True, "msg": "ถอด proxy แล้ว — CA กับ route ยังอยู่"}
+
+
+def act_proxy_restart() -> dict:
+    p = subprocess.run(["launchctl", "kickstart", "-k", f"gui/{os.getuid()}/{AGENT_LABEL}"],
+                       capture_output=True, text=True)
+    return ({"ok": True, "msg": "restart proxy แล้ว"} if p.returncode == 0
+            else {"ok": False, "msg": "restart ไม่สำเร็จ — ติดตั้งหรือยัง?"})
+
+
+def act_trust() -> dict:
+    if not ensure_ca():
+        return {"ok": False, "msg": "สร้าง CA ไม่สำเร็จ — build dnsdevd หรือยัง?"}
+    if ca_trusted():
+        return {"ok": True, "msg": "cert ถูกติดตั้งอยู่แล้ว"}
+    ok, msg = run_admin(
+        f"security add-trusted-cert -d -r trustRoot -p ssl "
+        f"-k /Library/Keychains/System.keychain {CA_PEM}",
+        "dnsdev — ติดตั้ง cert ของ dnsdev เข้าเครื่อง")
+    return {"ok": ok, "msg": "ติดตั้ง cert แล้ว — https ในเครื่องจะไม่ขึ้นเตือนอีก" if ok else msg}
+
+
+def act_untrust() -> dict:
+    ok, msg = run_admin(f"security remove-trusted-cert -d {CA_PEM}",
+                        "dnsdev — เอา cert ของ dnsdev ออกจากเครื่อง")
+    return {"ok": ok, "msg": "เอา cert ออกแล้ว" if ok else msg}
+
+
+def act_route(domain: str, port: str) -> dict:
+    domain = (domain or "").strip().strip(".").lower()
+    port = (port or "").strip().lstrip(":")
+    if not domain:
+        return {"ok": False, "msg": "ต้องระบุโดเมน"}
+    https, http, routes = read_routes()
+    routes = [r for r in routes if r["host"] != domain]
+    if port:
+        if not port.isdigit() or not (1 <= int(port) <= 65535):
+            return {"ok": False, "msg": f"พอร์ตไม่ถูกต้อง: {port}"}
+        routes.append({"host": domain, "to": f"127.0.0.1:{int(port)}", "passthrough": False})
+        msg = f"https://{domain} → :{int(port)}"
+    else:
+        msg = f"เอา {domain} ออกจาก proxy แล้ว"
+    write_routes(https, http, routes)
+    return {"ok": True, "msg": msg}
+
+
 # ---------- HTTP ----------
 class Handler(http.server.BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
@@ -296,6 +499,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self._json(act_restart())
             elif path == "/api/test":
                 self._json({"ok": True, "probe": probe(data.get("domain", ""))})
+            elif path == "/api/route":
+                self._json(act_route(data.get("domain", ""), data.get("port", "")))
+            elif path == "/api/proxy":
+                op = data.get("op", "")
+                self._json({"install": act_proxy_install, "uninstall": act_proxy_uninstall,
+                            "restart": act_proxy_restart}.get(op, lambda: {
+                                "ok": False, "msg": f"ไม่รู้จัก op: {op}"})())
+            elif path == "/api/trust":
+                self._json(act_untrust() if data.get("off") else act_trust())
             else:
                 self._json({"ok": False, "msg": "ไม่รู้จัก endpoint"}, 404)
         except Exception as e:
@@ -409,12 +621,17 @@ button.danger:hover{color:var(--err);border-color:var(--err)}
     <form class="add" id="addf" autocomplete="off">
       <input id="dom" placeholder="myapp.test" spellcheck="false" required>
       <input id="ip" class="ip mono" placeholder="127.0.0.1" spellcheck="false">
+      <input id="port" class="ip mono" placeholder=":3000" spellcheck="false" style="max-width:80px">
       <button id="addb">เพิ่ม</button>
     </form>
   </div>
   <div class="hint">wildcard ครอบทุก subdomain ทุกชั้นอัตโนมัติ — เพิ่ม <code>api.myapp.test</code>
     ทีหลังไม่ต้องมาตั้งอะไรอีก · เว้น IP ว่าง = <code>127.0.0.1</code> ·
-    ชี้ VM ก็ได้ เช่น <code>10.100.0.9</code> (กฎที่เจาะจงกว่าชนะ wildcard เสมอ)</div>
+    ชี้ VM ก็ได้ เช่น <code>10.100.0.9</code> (กฎที่เจาะจงกว่าชนะ wildcard เสมอ) ·
+    ใส่พอร์ตของ dev server แล้วเปิด <code>https://โดเมน</code> ได้เลยไม่ต้องพิมพ์พอร์ต</div>
+
+  <h2>ชั้น https</h2>
+  <div class="card" id="proxy"></div>
 
   <h2>zones</h2>
   <div class="card" id="zones"><div class="empty">กำลังโหลด…</div></div>
@@ -450,12 +667,52 @@ function probeRow(p){
     ${line('ชั้น dnsmasq', p.dnsmasq)}${line('ชั้นระบบ (ที่ app ใช้จริง)', p.system)}</div>`;
 }
 
+const shortTo = to => {
+  const p = String(to).split(':');
+  return (p.length === 2 && p[0] === '127.0.0.1') ? ':' + p[1] : to;
+};
+
+function proxyPill(px){
+  if(!px.installed && !px.routes.length) return '';
+  if(!px.installed) return '<span class="pill off">https ยังไม่ติดตั้ง</span>';
+  if(!px.pid) return '<span class="pill off">https หยุด</span>';
+  return px.ca_trusted
+    ? `<span class="pill on">https :${px.https}</span>`
+    : '<span class="pill off">https · ยังไม่มี cert</span>';
+}
+
+/// การ์ดนี้คือที่เดียวที่ควบคุมชั้น https ได้ครบ — ติดตั้ง/ถอด proxy กับ cert
+function proxyCard(px){
+  const rows = px.routes.length
+    ? px.routes.map(r => `<div class="d" style="padding:2px 0">
+        <span class="mono">https://${esc(r.host)}</span>
+        <small class="mono">→ ${esc(r.to)}${r.passthrough?'  (passthrough)':''}</small></div>`).join('')
+    : '<div class="empty" style="padding:8px 0">ยังไม่มี route — ใส่พอร์ตตอนเพิ่มโดเมน หรือกด <b>+ https</b> ที่แถว zone</div>';
+  const btn = (cls, label, extra='') => `<button class="ghost ${cls}" ${extra}>${label}</button>`;
+  const ctl = px.installed
+    ? btn('act-px', px.pid ? 'restart proxy' : 'เริ่ม proxy', 'data-op="restart"')
+      + btn('act-px danger', 'ถอด proxy', 'data-op="uninstall"')
+    : btn('act-px', 'ติดตั้ง proxy', 'data-op="install"');
+  const cert = px.ca_trusted
+    ? btn('act-trust danger', 'เอา cert ออกจากเครื่อง', 'data-off="1"')
+    : btn('act-trust', 'ติดตั้ง cert เข้าเครื่อง');
+  const warn = !px.has_daemon
+    ? '<div class="note n-err" style="margin-top:8px">หา <code>dnsdevd</code> ไม่เจอ — build ก่อนด้วย <code>app/build.sh</code></div>'
+    : (px.port_holder
+        ? `<div class="note n-warn" style="margin-top:8px">:${px.https} ถูก <code>${esc(px.port_holder)}</code> ยึดอยู่</div>`
+        : '');
+  return rows + `<div style="margin-top:10px;display:flex;gap:6px;flex-wrap:wrap">${ctl}${cert}</div>` + warn;
+}
+
 function render(s){
   $('#pills').innerHTML =
     `<span class="pill ${s.running?'on':'off'}">${s.running?'dnsmasq ทำงาน · pid '+s.running:'dnsmasq ไม่ได้รัน'}</span>
      <span class="pill ${s.syntax_ok?'':'off'}">${s.syntax_ok?'syntax ผ่าน':'syntax ผิด'}</span>
      <span class="pill ${s.conf_dir?'':'off'}">${s.conf_dir?'conf-dir ok':'ไม่มี conf-dir'}</span>
+     ${proxyPill(s.proxy)}
      <span class="pill">${esc(s.prefix)} · ${esc(s.arch)}</span>`;
+
+  $('#proxy').innerHTML = proxyCard(s.proxy);
 
   const z = $('#zones');
   if(!s.zones.length){
@@ -467,9 +724,17 @@ function render(s){
         : `<span class="badge b-err">ไม่มี resolver — ใช้ไม่ได้</span>`;
       const sh = x.shadow.length
         ? `<span class="badge b-warn">/etc/hosts ทับ ${x.shadow.length}</span>` : '';
+      const rt = (s.proxy.routes || []).find(r => r.host === x.domain);
+      const live = s.proxy.pid && s.proxy.ca_trusted;
+      const pb = rt
+        ? `<a class="badge ${live?'b-ok':'b-warn'}" href="https://${esc(x.domain)}" target="_blank"
+             title="${live?'เปิด https://'+esc(x.domain):'proxy ยังไม่พร้อม — route นี้ยังไม่มีผล'}"
+             style="text-decoration:none">https ${esc(shortTo(rt.to))}${rt.passthrough?' ⇢':''}</a>`
+        : '';
       return `<div class="zone" data-d="${esc(x.domain)}">
         <div class="d">*.${esc(x.domain)}<small class="mono">→ ${esc(x.ip)}</small></div>
-        ${rb}${sh}
+        ${pb}${rb}${sh}
+        <button class="ghost act-port">${rt?'พอร์ต':'+ https'}</button>
         <button class="ghost act-test">ทดสอบ</button>
         <button class="ghost danger act-rm">ลบ</button></div>`;
     }).join('');
@@ -485,23 +750,40 @@ function render(s){
     d.push(['warn',`<b>${esc(x.domain)}</b> ถูก /etc/hosts ทับ (${x.shadow.map(esc).join(', ')}) — hosts ชนะ DNS เสมอ subdomain อื่นจะยังใช้ไม่ได้`]));
   s.orphans.forEach(o =>
     d.push(['warn',`<code>/etc/resolver/${esc(o)}</code> ไม่มี zone รองรับ — query จะวิ่งไป dnsmasq แล้ว forward ออก internet เปล่า ๆ ทำให้ช้า`]));
+  const px = s.proxy;
+  if(px.installed && !px.pid)
+    d.push(['err','dnsdevd ไม่ได้รัน'+(px.port_holder?` — :${px.https} ถูก <code>${esc(px.port_holder)}</code> ยึดอยู่`:'')]);
+  if(!px.installed && px.routes.length)
+    d.push(['warn',`มี route ของ proxy อยู่ ${px.routes.length} อัน แต่ยังไม่ได้ติดตั้ง dnsdevd`]);
+  if(px.pid && px.routes.some(r=>!r.passthrough) && !px.ca_trusted)
+    d.push(['warn','cert ของ dnsdev ยังไม่ถูกติดตั้งในเครื่อง — browser จะเตือนทุกครั้งที่เปิด https']);
   $('#doctor').innerHTML = d.length
     ? d.map(([k,m])=>`<div class="note n-${k}">${m}</div>`).join('')
     : '<div class="note n-ok">ไม่พบปัญหา</div>';
 }
 
-async function refresh(){ render(await api('/api/state')); }
+async function refresh(){
+  const s = await api('/api/state');
+  window.__state = s;
+  render(s);
+}
 
 $('#addf').addEventListener('submit', async e => {
   e.preventDefault();
   const domain = $('#dom').value.trim(), ip = $('#ip').value.trim();
+  const port = $('#port').value.trim();
   if(!domain) return;
   document.body.classList.add('busy'); $('#addb').textContent = 'รอกรอกรหัส…';
   const r = await api('/api/add', {domain, ip});
   document.body.classList.remove('busy'); $('#addb').textContent = 'เพิ่ม';
   toast(r.msg, r.ok ? 'ok' : 'err');
   if(r.ok){
-    $('#dom').value = ''; $('#ip').value = '';
+    $('#dom').value = ''; $('#ip').value = ''; $('#port').value = '';
+    // zone เข้าแล้วค่อยผูก route — zone ล้มก็ไม่ควรมี route ค้าง
+    if(port){
+      const rr = await api('/api/route', {domain, port});
+      if(!rr.ok) toast(rr.msg, 'err');
+    }
     await refresh();
     if(r.warn) toast(r.warn, 'err');
     const row = document.querySelector(`.zone[data-d="${CSS.escape(domain.trim().toLowerCase())}"]`);
@@ -509,9 +791,49 @@ $('#addf').addEventListener('submit', async e => {
   }
 });
 
+$('#zones').addEventListener('keydown', e => {
+  if(e.key === 'Enter' && e.target.classList.contains('port-in')){
+    e.preventDefault();
+    e.target.closest('.zone').querySelector('.act-port-ok').click();
+  }
+});
+
+$('#proxy').addEventListener('click', async e => {
+  const b = e.target.closest('button'); if(!b) return;
+  document.body.classList.add('busy');
+  const r = b.classList.contains('act-trust')
+    ? await api('/api/trust', b.dataset.off ? {off: true} : {})
+    : await api('/api/proxy', {op: b.dataset.op});
+  document.body.classList.remove('busy');
+  toast(r.msg, r.ok ? 'ok' : 'err');
+  await refresh();
+});
+
 $('#zones').addEventListener('click', async e => {
   const row = e.target.closest('.zone'); if(!row) return;
   const domain = row.dataset.d;
+  // แก้ inline ให้เหมือนที่อื่นในหน้านี้ — ไม่ใช้ prompt() ซึ่งบล็อกทั้งหน้า
+  if(e.target.classList.contains('act-port')){
+    if(row.querySelector('.port-in')) return;
+    const cur = (window.__state?.proxy?.routes || []).find(r => r.host === domain);
+    const box = document.createElement('span');
+    box.style.cssText = 'display:flex;gap:6px;align-items:center';
+    box.innerHTML = `<input class="port-in mono" style="max-width:82px" placeholder=":3000"
+        value="${cur ? esc(cur.to.split(':').pop()) : ''}">
+      <button class="ghost act-port-ok">ตกลง</button>
+      <button class="ghost act-port-no">ยกเลิก</button>`;
+    e.target.replaceWith(box);
+    box.querySelector('input').focus();
+    return;
+  }
+  if(e.target.classList.contains('act-port-no')){ await refresh(); return; }
+  if(e.target.classList.contains('act-port-ok')){
+    const port = row.querySelector('.port-in').value.trim();
+    const r = await api('/api/route', {domain, port});
+    toast(r.msg, r.ok ? 'ok' : 'err');
+    await refresh();
+    return;
+  }
   if(e.target.classList.contains('act-test')){
     e.target.disabled = true;
     const r = await api('/api/test', {domain});
