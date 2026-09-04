@@ -233,19 +233,42 @@ func pipe(_ a: NWConnection, _ b: NWConnection) {
     pump(a, b); pump(b, a)
 }
 
+func isLoopback(_ host: String) -> Bool {
+    host == "127.0.0.1" || host == "::1" || host == "localhost" || host.hasPrefix("127.")
+}
+
 func connect(to target: String, then ready: @escaping (NWConnection?) -> Void) {
     let parts = target.split(separator: ":")
     let host = String(parts.first ?? "127.0.0.1")
     let port = UInt16(parts.count > 1 ? String(parts[1]) : "80") ?? 80
     guard let p = NWEndpoint.Port(rawValue: port) else { ready(nil); return }
     let c = NWConnection(host: NWEndpoint.Host(host), port: p, using: .tcp)
+
+    let lock = NSLock()
     var settled = false
+    func settle(_ conn: NWConnection?, _ why: String?) {
+        lock.lock(); let first = !settled; settled = true; lock.unlock()
+        guard first else { return }
+        if let why { log(why) }
+        ready(conn)
+    }
+
+    // ปลายทางที่ไม่ตอบเลยต้องเลิกเองภายในเวลาที่กำหนด ไม่ใช่ค้างจน client ยอมแพ้
+    // เคสที่เจอจริง: macOS บล็อก Local Network ของ process ที่ launchd เป็นคนรัน
+    // การเชื่อมต่อไป IP ในวงแลนจะเงียบสนิท ไม่ error ไม่ปิด
+    DispatchQueue.global().asyncAfter(deadline: .now() + 5) {
+        c.cancel()
+        settle(nil, "ต่อ \(target) ไม่สำเร็จใน 5 วิ"
+            + (isLoopback(host) ? " — ปลายทางไม่ตอบ"
+               : " — ปลายทางอยู่นอก loopback ถ้า dnsdevd ถูกรันโดย launchd"
+                 + " ให้เปิดสิทธิ์ Local Network ให้มันใน System Settings › Privacy & Security"))
+    }
+
     c.stateUpdateHandler = { st in
         switch st {
-        case .ready: if !settled { settled = true; ready(c) }
-        case .failed(let e):
-            if !settled { settled = true; log("ต่อ \(target) ไม่ได้: \(e)"); ready(nil) }
-        case .cancelled: if !settled { settled = true; ready(nil) }
+        case .ready: settle(c, nil)
+        case .failed(let e): settle(nil, "ต่อ \(target) ไม่ได้: \(e)")
+        case .cancelled: settle(nil, nil)
         default: break
         }
     }
@@ -325,7 +348,10 @@ final class Proxy {
         }
         log("โหลดใหม่: \(new.routes.count) route · https :\(httpsPort) · http :\(httpPort)")
         for r in new.routes {
-            log("  \(r.host) → \(r.to)\(r.passthrough ? "  [passthrough]" : "")")
+            let host = String(r.to.split(separator: ":").first ?? "")
+            let note = isLoopback(host) ? ""
+                : "  ⚠︎ นอก loopback — ต้องมีสิทธิ์ Local Network"
+            log("  \(r.host) → \(r.to)\(r.passthrough ? "  [passthrough]" : "")\(note)")
         }
         watchFile()
     }

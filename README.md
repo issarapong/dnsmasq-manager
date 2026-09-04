@@ -97,6 +97,13 @@ app/build.sh          # universal binary + bundle + ad-hoc sign + ติดต�
 - **คิวของ listener** — `NWListener` รายงานสถานะกลับมาทางคิวที่ให้ไว้ ถ้า `reload()`
   รันบนคิวเดียวกันแล้วรอ semaphore มันจะรอตัวเองจนหมดเวลาแล้ว proxy ดับทั้งตัว
   (ดู `lq` ใน `Proxy.swift`)
+- **Local Network privacy** — macOS กันไม่ให้ process ต่อไปยัง IP ในวงแลน จนกว่าจะ
+  ได้รับอนุญาต และการถูกกันจะ **เงียบสนิท** ไม่ error ไม่ปิด connection แค่ค้าง
+  loopback ได้รับยกเว้น ฉะนั้น route ที่ชี้ไป `127.0.0.1` ทำงานได้เสมอ แต่ route ที่ชี้ไป
+  IP ของ VM จะค้างเมื่อ `dnsdevd` ถูกรันโดย launchd (รันจากเทอร์มินัลจะได้สิทธิ์ของ
+  เทอร์มินัลติดมาด้วย จึงผ่าน — ทำให้หลงทางได้ง่ายมาก) เปิดสิทธิ์ให้ที่
+  System Settings › Privacy & Security › Local Network · `dnsdevd` เลิกรอเองใน 5 วิ
+  แล้ว log บอกสาเหตุไว้ ไม่ปล่อยค้างจน browser ยอมแพ้
 - **ดีบักหน้าตาแอป** — `dnsdev --popover` เปิด popover ให้เองตอนขึ้น
 - **TextEditor กับ JSON** — `TextEditor` ของ SwiftUI เปิด smart quotes ไว้ พิมพ์ `"`
   แล้วได้ `"` ซึ่งทำ JSON พังแบบมองด้วยตาแทบไม่เห็น ตัวแก้ในแอปจึงห่อ `NSTextView`
