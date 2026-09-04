@@ -46,9 +46,13 @@ route มีสองโหมด — **terminate** (ค่าเริ่มต
 เว็บอยู่ในการ์ด "ชั้น https" CLI ใช้ `dnsdev proxy` / `dnsdev trust`
 
 config ทั้งหมดอยู่ที่ `~/.config/dnsdev/routes.json` แก้มือได้ daemon เฝ้าอยู่
-มีผลทันทีไม่ต้อง restart · เปิดจากเมนู `⋯ → แก้ไฟล์ routes.json` หรือ
-`dnsdev proxy edit` (ตรวจ JSON ให้หลังปิด editor) · JSON พังจะไม่ล้ม route เดิม
-daemon ใช้ค่าเดิมต่อจนกว่าจะแก้ถูก
+มีผลทันทีไม่ต้อง restart แก้ได้สามทาง:
+
+- เมนู `⋯ → แก้ JSON ในแอป` — ตัวแก้ในตัวแอป ตรวจให้ก่อนบันทึก (`⌘S`)
+- เมนู `⋯ → เปิด routes.json ในตัวแก้ข้อความ` หรือ `dnsdev proxy edit`
+- แก้ไฟล์ตรง ๆ ด้วยอะไรก็ได้
+
+JSON พังจะไม่ล้ม route เดิม — daemon ใช้ค่าเดิมต่อจนกว่าจะแก้ถูก แล้ว log บอกไว้
 
 `~/.local/bin/dnsdev` และ `~/.local/bin/dnsdev-ui` เป็น symlink มาที่รีโปนี้
 แก้ไฟล์ที่นี่มีผลทันที — แต่ถ้า `/Volumes/Server` ไม่ได้ mount คำสั่งจะหาย
@@ -94,6 +98,9 @@ app/build.sh          # universal binary + bundle + ad-hoc sign + ติดต�
   รันบนคิวเดียวกันแล้วรอ semaphore มันจะรอตัวเองจนหมดเวลาแล้ว proxy ดับทั้งตัว
   (ดู `lq` ใน `Proxy.swift`)
 - **ดีบักหน้าตาแอป** — `dnsdev --popover` เปิด popover ให้เองตอนขึ้น
+- **TextEditor กับ JSON** — `TextEditor` ของ SwiftUI เปิด smart quotes ไว้ พิมพ์ `"`
+  แล้วได้ `"` ซึ่งทำ JSON พังแบบมองด้วยตาแทบไม่เห็น ตัวแก้ในแอปจึงห่อ `NSTextView`
+  เองแล้วปิดการแทนที่ทุกชนิด (ดู `CodeEditor`)
 
 ## ค้างอยู่
 

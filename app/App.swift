@@ -466,6 +466,59 @@ enum Prox {
         Sys.run("/bin/launchctl", ["kickstart", "-k", "gui/\(getuid())/\(label)"]).code == 0
     }
 
+    static let defaultRoutesText = """
+    {
+      "https": 443,
+      "http": 80,
+      "routes": [
+        { "host": "myapp.test", "to": "127.0.0.1:3000" }
+      ]
+    }
+    """
+
+    static func readRoutesRaw() -> String {
+        (try? String(contentsOfFile: routesFile, encoding: .utf8)) ?? defaultRoutesText
+    }
+
+    static func writeRoutesRaw(_ text: String) throws {
+        try FileManager.default.createDirectory(atPath: stateDir, withIntermediateDirectories: true)
+        let body = text.hasSuffix("\n") ? text : text + "\n"
+        // atomically:true เขียนไฟล์ชั่วคราวแล้ว rename ทับ — dnsdevd เห็นครั้งเดียวจบ
+        try body.write(toFile: routesFile, atomically: true, encoding: .utf8)
+    }
+
+    /// ตรวจก่อนเขียนเสมอ — ถ้าปล่อยไฟล์พังลงไป dnsdevd จะเมินการแก้ทั้งก้อน
+    /// แล้วใช้ค่าเดิมต่อ ซึ่งดูเหมือน "กดบันทึกแล้วไม่มีอะไรเกิดขึ้น"
+    /// คืน nil = ผ่าน
+    static func validateRoutes(_ text: String) -> String? {
+        guard let d = text.data(using: .utf8) else { return "แปลงเป็น UTF-8 ไม่ได้" }
+        let obj: Any
+        do { obj = try JSONSerialization.jsonObject(with: d) }
+        catch { return "JSON ผิด — \(error.localizedDescription)" }
+        guard let o = obj as? [String: Any] else { return "ระดับบนสุดต้องเป็น object { }" }
+        for k in ["https", "http"] where o[k] != nil {
+            guard let n = o[k] as? NSNumber, (1...65535).contains(n.intValue) else {
+                return "\"\(k)\" ต้องเป็นตัวเลข 1–65535"
+            }
+        }
+        guard let raw = o["routes"] else { return "ไม่มีคีย์ \"routes\"" }
+        guard let arr = raw as? [[String: Any]] else { return "\"routes\" ต้องเป็น array ของ object" }
+        for (i, r) in arr.enumerated() {
+            guard let h = r["host"] as? String, !h.isEmpty else { return "routes[\(i)] ไม่มี \"host\"" }
+            guard let t = r["to"] as? String, t.contains(":"), !t.hasPrefix(":"), !t.hasSuffix(":") else {
+                return "routes[\(i)] (\(h)) — \"to\" ต้องเป็นรูป host:port"
+            }
+            guard let port = t.split(separator: ":").last, let n = Int(port),
+                  (1...65535).contains(n) else {
+                return "routes[\(i)] (\(h)) — พอร์ตใน \"to\" ไม่ถูกต้อง"
+            }
+            if let m = r["mode"] as? String, m != "terminate", m != "passthrough" {
+                return "routes[\(i)] (\(h)) — mode ต้องเป็น terminate หรือ passthrough"
+            }
+        }
+        return nil
+    }
+
     /// เปิดด้วย `open -t` ไม่ใช่ NSWorkspace — .json อาจถูกผูกไว้กับ Xcode หรือแอปอื่น
     /// ที่ไม่ได้ตั้งใจ `-t` บังคับให้ใช้ตัวแก้ข้อความเริ่มต้นของระบบเสมอ
     static func openRoutesFile() {
@@ -864,6 +917,23 @@ final class Store: ObservableObject {
                           note: "เอา \(domain) ออกจาก proxy แล้ว")
     }
 
+    func saveRoutesJSON(_ text: String) async -> Bool {
+        if let err = Prox.validateRoutes(text) { say(err, bad: true); return false }
+        do {
+            try await Task.detached(priority: .userInitiated) {
+                try Prox.writeRoutesRaw(text)
+            }.value
+        } catch {
+            say("เขียน routes.json ไม่ได้: \(error.localizedDescription)", bad: true)
+            return false
+        }
+        // ให้ dnsdevd อ่านไฟล์ใหม่ทัน (debounce ฝั่งมัน 0.3 วิ) ค่อยอ่านสถานะ
+        try? await Task.sleep(for: .milliseconds(600))
+        await refresh()
+        say("บันทึก routes.json แล้ว — \(proxy.routes.count) route")
+        return true
+    }
+
     private func writeRoutes(_ routes: [ProxyRoute], note: String) async {
         let https = proxy.https, http = proxy.http
         do {
@@ -1099,6 +1169,47 @@ struct KindPicker: View {
     }
 }
 
+/// TextEditor ของ SwiftUI เปิด smart quotes ไว้ พิมพ์ " แล้วได้ " ซึ่งทำ JSON พัง
+/// แบบมองด้วยตาแทบไม่เห็น ต้องลงไปคุม NSTextView เองเพื่อปิดการแทนที่ทุกชนิด
+struct CodeEditor: NSViewRepresentable {
+    @Binding var text: String
+
+    func makeNSView(context: Context) -> NSScrollView {
+        let sv = NSTextView.scrollableTextView()
+        sv.hasVerticalScroller = true
+        sv.borderType = .bezelBorder
+        guard let tv = sv.documentView as? NSTextView else { return sv }
+        tv.isAutomaticQuoteSubstitutionEnabled = false
+        tv.isAutomaticDashSubstitutionEnabled = false
+        tv.isAutomaticTextReplacementEnabled = false
+        tv.isAutomaticSpellingCorrectionEnabled = false
+        tv.isContinuousSpellCheckingEnabled = false
+        tv.isRichText = false
+        tv.allowsUndo = true
+        tv.font = .monospacedSystemFont(ofSize: 11, weight: .regular)
+        tv.textContainerInset = NSSize(width: 4, height: 6)
+        tv.delegate = context.coordinator
+        tv.string = text
+        return sv
+    }
+
+    func updateNSView(_ sv: NSScrollView, context: Context) {
+        guard let tv = sv.documentView as? NSTextView, tv.string != text else { return }
+        tv.string = text
+    }
+
+    func makeCoordinator() -> Coordinator { Coordinator(self) }
+
+    final class Coordinator: NSObject, NSTextViewDelegate {
+        private let parent: CodeEditor
+        init(_ p: CodeEditor) { parent = p }
+        func textDidChange(_ n: Notification) {
+            guard let tv = n.object as? NSTextView else { return }
+            parent.text = tv.string
+        }
+    }
+}
+
 struct ZoneRow: View {
     @EnvironmentObject var store: Store
     var zone: Zone
@@ -1249,14 +1360,21 @@ struct ContentView: View {
     @State private var port = ""
     @State private var kind: ZoneKind = .address
     @State private var listHeight: CGFloat = 0
+    @State private var editingJSON = false
+    @State private var jsonText = ""
+    @State private var jsonError: String?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             header
             Divider()
-            adder
-            Divider()
-            list
+            if editingJSON {
+                jsonEditor
+            } else {
+                adder
+                Divider()
+                list
+            }
             if let f = store.flash {
                 Divider()
                 Text(f.text)
@@ -1302,7 +1420,8 @@ struct ContentView: View {
                 } else {
                     Button("ติดตั้ง cert เข้าเครื่อง…") { Task { await store.trustCA() } }
                 }
-                Button("แก้ไฟล์ routes.json") { Prox.openRoutesFile() }
+                Button(editingJSON ? "ปิดตัวแก้ JSON" : "แก้ JSON ในแอป") { toggleJSON() }
+                Button("เปิด routes.json ในตัวแก้ข้อความ") { Prox.openRoutesFile() }
                 Button("เปิดโฟลเดอร์ dnsdev") {
                     NSWorkspace.shared.open(URL(fileURLWithPath: Prox.stateDir))
                 }
@@ -1407,6 +1526,55 @@ struct ContentView: View {
         // ในหน้าต่างที่ย่อตามเนื้อหาอย่าง popover — ต้องวัดเนื้อในแล้วกำหนดความสูงตรง ๆ
         .frame(height: min(max(listHeight, 1), 330))
         .onPreferenceChange(ListHeightKey.self) { listHeight = $0 }
+    }
+
+    private var jsonEditor: some View {
+        VStack(alignment: .leading, spacing: 7) {
+            HStack(spacing: 6) {
+                Text("routes.json").font(.system(size: 11.5, weight: .semibold))
+                Text(Prox.routesFile.replacingOccurrences(of: NSHomeDirectory(), with: "~"))
+                    .font(.system(size: 9.5, design: .monospaced))
+                    .foregroundStyle(.secondary).lineLimit(1).truncationMode(.head)
+                Spacer()
+            }
+            CodeEditor(text: $jsonText).frame(height: 230)
+            if let e = jsonError {
+                Text(e).font(.system(size: 10.5)).foregroundStyle(.red)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            HStack(spacing: 8) {
+                Text("บันทึกแล้วมีผลทันที ไม่ต้อง restart")
+                    .font(.system(size: 10)).foregroundStyle(.secondary)
+                Spacer()
+                Button("โหลดใหม่") { loadJSON() }
+                    .buttonStyle(.borderless).font(.system(size: 11))
+                Button("ปิด") { editingJSON = false }
+                    .buttonStyle(.borderless).font(.system(size: 11))
+                Button("บันทึก") { saveJSON() }
+                    .font(.system(size: 11))
+                    .keyboardShortcut("s", modifiers: .command)
+                    .disabled(store.busy)
+            }
+        }
+        .padding(.horizontal, 12).padding(.vertical, 10)
+    }
+
+    private func toggleJSON() {
+        editingJSON.toggle()
+        if editingJSON { loadJSON() }
+    }
+
+    private func loadJSON() {
+        jsonText = Prox.readRoutesRaw()
+        jsonError = nil
+    }
+
+    private func saveJSON() {
+        // ตรวจก่อนแตะไฟล์ — ไฟล์พังลงไปแล้ว dnsdevd จะเมินการแก้ทั้งก้อนแบบเงียบ ๆ
+        if let err = Prox.validateRoutes(jsonText) { jsonError = err; return }
+        jsonError = nil
+        let t = jsonText
+        Task { _ = await store.saveRoutesJSON(t) }
     }
 
     private func submit() {
